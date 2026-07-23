@@ -32,6 +32,7 @@ struct AppError(String);
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        eprintln!("app_error: {}", self.0);
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, self.0).into_response()
     }
 }
@@ -241,6 +242,7 @@ async fn login() -> Result<Response, AppError> {
 }
 
 async fn google_start(State(state): State<AppState>) -> Result<Response, AppError> {
+    eprintln!("oauth_start: redirecting to Google");
     let mut url = Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
         .map_err(|error| AppError(format!("invalid google auth URL: {error}")))?;
     url.query_pairs_mut()
@@ -272,8 +274,11 @@ async fn google_callback(
     let code = query
         .code
         .ok_or_else(|| AppError("missing OAuth code".to_owned()))?;
+    eprintln!("oauth_callback: exchanging code");
     let token = exchange_google_code(&state, &code).await?;
+    eprintln!("oauth_callback: fetching Gmail profile");
     let email = fetch_gmail_profile_email(&state, &token.access_token).await?;
+    eprintln!("oauth_callback: upserting user {email}");
     let user_id = upsert_user(&state.pool, &email, &token).await?;
     sync_latest_threads(
         &state,
@@ -419,7 +424,12 @@ async fn sync_gmail(
         return Ok(Redirect::to("/login"));
     };
 
+    eprintln!(
+        "sync_route: started for user_id={} email={}",
+        session.user_id, session.email
+    );
     sync_latest_threads(&state, &session).await?;
+    eprintln!("sync_route: completed for user_id={}", session.user_id);
     Ok(Redirect::to("/"))
 }
 
@@ -564,6 +574,10 @@ fn filters(selected: &str) -> Vec<FilterOption<'_>> {
 }
 
 async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<(), AppError> {
+    eprintln!(
+        "gmail_sync: listing latest 10 threads for user_id={}",
+        session.user_id
+    );
     let response = state
         .http
         .get("https://gmail.googleapis.com/gmail/v1/users/me/threads")
@@ -573,10 +587,24 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
         .await?
         .error_for_status()?;
     let threads = response.json::<GmailThreadsResponse>().await?;
+    let threads = threads.threads.unwrap_or_default();
+    eprintln!("gmail_sync: received {} thread stubs", threads.len());
 
-    for thread in threads.threads.unwrap_or_default() {
+    for (index, thread) in threads.iter().enumerate() {
+        eprintln!(
+            "gmail_sync: fetching thread {}/{} gmail_thread_id={}",
+            index + 1,
+            threads.len(),
+            thread.id
+        );
         let gmail_thread = fetch_gmail_thread(state, session, &thread.id).await?;
+        eprintln!(
+            "gmail_sync: fetched gmail_thread_id={} messages={}",
+            gmail_thread.id,
+            gmail_thread.messages.len()
+        );
         let thread_id = upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+        eprintln!("gmail_sync: upserted local thread_id={thread_id}; starting classifier");
         set_thread_state(
             &state.pool,
             thread_id,
@@ -586,6 +614,7 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
         )
         .await?;
         run_classifier(state, session, thread_id).await?;
+        eprintln!("gmail_sync: finished processing local thread_id={thread_id}");
     }
 
     Ok(())
@@ -596,6 +625,7 @@ async fn fetch_gmail_thread(
     session: &UserSession,
     gmail_thread_id: &str,
 ) -> Result<GmailThreadResponse, AppError> {
+    eprintln!("gmail_thread_get: request gmail_thread_id={gmail_thread_id}");
     let response = state
         .http
         .get(format!(
@@ -614,6 +644,11 @@ async fn upsert_gmail_thread(
     user_id: i64,
     gmail_thread: &GmailThreadResponse,
 ) -> Result<i64, sqlx::Error> {
+    eprintln!(
+        "gmail_thread_upsert: user_id={user_id} gmail_thread_id={} messages={}",
+        gmail_thread.id,
+        gmail_thread.messages.len()
+    );
     let first_message = gmail_thread.messages.first();
     let last_message = gmail_thread.messages.last();
     let subject = first_message
@@ -688,7 +723,9 @@ async fn run_classifier(
     session: &UserSession,
     thread_id: i64,
 ) -> Result<(), AppError> {
+    eprintln!("classifier: start thread_id={thread_id}");
     let Some(openrouter_key) = session.openrouter_key.as_deref() else {
+        eprintln!("classifier: missing OpenRouter key thread_id={thread_id}");
         create_user_form(
             &state.pool,
             thread_id,
@@ -710,18 +747,35 @@ async fn run_classifier(
 
     log_thread_event(&state.pool, thread_id, "agent", "Classifier started").await?;
     let context = thread_context(&state.pool, thread_id).await?;
+    eprintln!(
+        "classifier: built context thread_id={thread_id} bytes={}",
+        context.len()
+    );
     let prompt = format!(
         "Classify this email thread. Return only JSON matching one of: {{\"decision\":\"needs_reply\"}}, {{\"decision\":\"waiting\",\"reason\":\"...\",\"wake_date\":\"YYYY-MM-DD\"}}, {{\"decision\":\"ask_to_resolve\",\"reason\":\"...\"}}. Use needs_reply only when the user owes a reply. Use waiting only when the user has already acted and we need an external response; waiting must include a wake_date. Use ask_to_resolve when no reply is needed and no external response is expected. The classifier cannot directly resolve threads.\n\n{context}"
     );
+    eprintln!(
+        "classifier: calling OpenRouter thread_id={thread_id} prompt_bytes={}",
+        prompt.len()
+    );
     let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
+    eprintln!(
+        "classifier: model response thread_id={thread_id} bytes={} preview={}",
+        model_response.len(),
+        preview(&model_response)
+    );
     let output = parse_json_content::<ClassifierOutput>(&model_response)?;
 
     match output {
         ClassifierOutput::NeedsReply => {
+            eprintln!("classifier: decision=needs_reply thread_id={thread_id}");
             set_thread_state(&state.pool, thread_id, "Processing", "Drafting reply", None).await?;
             run_reply_drafter(state, session, thread_id, None).await?;
         }
         ClassifierOutput::Waiting { reason, wake_date } => {
+            eprintln!(
+                "classifier: decision=waiting thread_id={thread_id} wake_date={wake_date} reason={reason}"
+            );
             set_thread_state(
                 &state.pool,
                 thread_id,
@@ -739,6 +793,7 @@ async fn run_classifier(
             .await?;
         }
         ClassifierOutput::AskToResolve { reason } => {
+            eprintln!("classifier: decision=ask_to_resolve thread_id={thread_id} reason={reason}");
             create_user_form(
                 &state.pool,
                 thread_id,
@@ -765,6 +820,7 @@ async fn run_classifier(
         }
     }
 
+    eprintln!("classifier: complete thread_id={thread_id}");
     Ok(())
 }
 
@@ -774,7 +830,9 @@ async fn run_reply_drafter(
     thread_id: i64,
     instruction: Option<&str>,
 ) -> Result<(), AppError> {
+    eprintln!("reply_drafter: start thread_id={thread_id}");
     let Some(openrouter_key) = session.openrouter_key.as_deref() else {
+        eprintln!("reply_drafter: missing OpenRouter key thread_id={thread_id}");
         create_user_form(
             &state.pool,
             thread_id,
@@ -796,12 +854,29 @@ async fn run_reply_drafter(
 
     log_thread_event(&state.pool, thread_id, "agent", "Reply drafter started").await?;
     let context = thread_context(&state.pool, thread_id).await?;
+    eprintln!(
+        "reply_drafter: built context thread_id={thread_id} bytes={}",
+        context.len()
+    );
     let instruction = instruction.unwrap_or("Draft a concise helpful reply.");
     let prompt = format!(
         "Draft an email reply for this thread. Return only JSON: {{\"draft\":\"...\"}}. User instruction: {instruction}\n\n{context}"
     );
+    eprintln!(
+        "reply_drafter: calling OpenRouter thread_id={thread_id} prompt_bytes={}",
+        prompt.len()
+    );
     let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
+    eprintln!(
+        "reply_drafter: model response thread_id={thread_id} bytes={} preview={}",
+        model_response.len(),
+        preview(&model_response)
+    );
     let output = parse_json_content::<DraftOutput>(&model_response)?;
+    eprintln!(
+        "reply_drafter: parsed draft thread_id={thread_id} bytes={}",
+        output.draft.len()
+    );
 
     create_user_form(
         &state.pool,
@@ -826,6 +901,7 @@ async fn run_reply_drafter(
         "Reply drafter created draft form",
     )
     .await?;
+    eprintln!("reply_drafter: complete thread_id={thread_id}");
     Ok(())
 }
 
@@ -834,21 +910,46 @@ async fn call_openrouter(
     api_key: &str,
     prompt: &str,
 ) -> Result<String, AppError> {
+    eprintln!(
+        "openrouter: request model=nvidia/nemotron-3-ultra-550b-a55b:free prompt_bytes={}",
+        prompt.len()
+    );
     let response = http
         .post("https://openrouter.ai/api/v1/chat/completions")
         .bearer_auth(api_key)
         .json(&serde_json::json!({
-            "model": "openai/gpt-4o-mini",
+            "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
             "messages": [{ "role": "user", "content": prompt }]
         }))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let status = response.status();
+    eprintln!("openrouter: response status={status}");
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+        return Err(AppError(format!(
+            "OpenRouter request failed status={status} body={}",
+            preview(&body)
+        )));
+    }
     let value = response.json::<serde_json::Value>().await?;
+    eprintln!("openrouter: response JSON parsed");
     value["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| AppError("OpenRouter response missing content".to_owned()))
+}
+
+fn preview(text: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let mut output: String = text.chars().take(MAX_CHARS).collect();
+    if text.chars().count() > MAX_CHARS {
+        output.push_str("...");
+    }
+    output.replace('\n', " ")
 }
 
 fn parse_json_content<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, AppError> {
@@ -897,6 +998,10 @@ async fn create_user_form(
     title: &str,
     body: &str,
 ) -> Result<(), sqlx::Error> {
+    eprintln!(
+        "db: create_user_form thread_id={thread_id} form_type={form_type} title={title} body_bytes={}",
+        body.len()
+    );
     sqlx::query(
         "UPDATE user_forms SET status = 'superseded' WHERE thread_id = ? AND status = 'active'",
     )
@@ -922,6 +1027,10 @@ async fn set_thread_state(
     latest_action: &str,
     waiting_until: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    eprintln!(
+        "db: set_thread_state thread_id={thread_id} state={state} latest_action={latest_action} waiting_until={}",
+        waiting_until.unwrap_or("")
+    );
     sqlx::query(
         "UPDATE threads SET state = ?, latest_action = ?, waiting_until = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
@@ -940,6 +1049,7 @@ async fn log_thread_event(
     actor: &str,
     message: &str,
 ) -> Result<(), sqlx::Error> {
+    eprintln!("db: log_thread_event thread_id={thread_id} actor={actor} message={message}");
     sqlx::query(
         "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
     )
