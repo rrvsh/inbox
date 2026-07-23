@@ -1,10 +1,19 @@
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Login</title></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
   <body>
-    <main>
+    <main class="login">
       <h1>Login with Google</h1>
-      <p><a href="/login/google">Connect Gmail</a></p>
+      <div class="card">
+        <p>Connect Gmail to build a small action inbox around your threads.</p>
+        <p class="muted">The app reads recent Gmail threads, classifies the next action, and keeps app-only state like waiting, needs action, and resolved.</p>
+        <p><a class="button primary" href="/login/google">Connect Gmail</a></p>
+      </div>
     </main>
   </body>
 </html>

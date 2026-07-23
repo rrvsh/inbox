@@ -1,0 +1,7 @@
+<form id="sync-button" method="post" action="/sync" hx-get="/partials/sync-button" hx-trigger="every 3s" hx-swap="outerHTML">
+  {% if syncing %}
+    <button type="submit" class="primary" disabled>Syncing…</button>
+  {% else %}
+    <button type="submit" class="primary">Sync Gmail</button>
+  {% endif %}
+</form>

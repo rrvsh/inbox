@@ -73,6 +73,30 @@ struct ThreadRow {
     waiting_until: Option<String>,
 }
 
+struct ThreadView {
+    id: i64,
+    subject: String,
+    from_display: String,
+    state_label: &'static str,
+    state_class: &'static str,
+    latest_action: String,
+    waiting_until: Option<String>,
+}
+
+impl From<ThreadRow> for ThreadView {
+    fn from(row: ThreadRow) -> Self {
+        Self {
+            state_label: state_label(&row.state),
+            state_class: state_class(&row.state),
+            id: row.id,
+            subject: row.subject,
+            from_display: row.from_display,
+            latest_action: row.latest_action,
+            waiting_until: row.waiting_until,
+        }
+    }
+}
+
 #[derive(FromRow)]
 struct MessageRow {
     sender: String,
@@ -92,12 +116,6 @@ struct ActionLogRow {
     actor: String,
     message: String,
     created_at: String,
-}
-
-#[derive(FromRow)]
-struct SyncJobRow {
-    status: String,
-    message: String,
 }
 
 struct FilterOption<'a> {
@@ -204,22 +222,32 @@ struct LoginTemplate;
 #[derive(Template)]
 #[template(path = "inbox.html")]
 struct InboxTemplate<'a> {
-    threads: Vec<ThreadRow>,
+    threads: Vec<ThreadView>,
     filters: Vec<FilterOption<'a>>,
     user_email: String,
-    sync_message: Option<String>,
-    auto_refresh: bool,
+    syncing: bool,
+}
+
+#[derive(Template)]
+#[template(path = "inbox_table.html")]
+struct InboxTableTemplate {
+    threads: Vec<ThreadView>,
+}
+
+#[derive(Template)]
+#[template(path = "sync_button.html")]
+struct SyncButtonTemplate {
+    syncing: bool,
 }
 
 #[derive(Template)]
 #[template(path = "thread.html")]
 struct ThreadTemplate {
-    thread: ThreadRow,
+    thread: ThreadView,
     messages: Vec<MessageRow>,
     form: Option<UserFormRow>,
     logs: Vec<ActionLogRow>,
     user_email: String,
-    auto_refresh: bool,
 }
 
 #[derive(Template)]
@@ -245,6 +273,17 @@ struct DraftOutput {
 fn render(template: impl Template) -> Result<Response, AppError> {
     let html = template.render()?;
     Ok(Html(html).into_response())
+}
+
+async fn style_css() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        include_str!("../static/style.css"),
+    )
+        .into_response()
 }
 
 async fn login() -> Result<Response, AppError> {
@@ -340,38 +379,40 @@ async fn inbox(
     };
     let selected_filter = query.state.as_deref().unwrap_or("NeedsAction");
     let selected_state = Some(selected_filter).filter(|value| *value != "all");
-    let threads = if let Some(selected_state) = selected_state {
-        sqlx::query_as::<_, ThreadRow>(
-            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? AND state = ? ORDER BY updated_at DESC",
-        )
-        .bind(session.user_id)
-        .bind(selected_state)
-        .fetch_all(&state.pool)
-        .await?
-    } else {
-        sqlx::query_as::<_, ThreadRow>(
-            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? ORDER BY updated_at DESC",
-        )
-        .bind(session.user_id)
-        .fetch_all(&state.pool)
-        .await?
-    };
-
-    let sync_job = latest_sync_job(&state.pool, session.user_id).await?;
-    let sync_message = sync_job.map(|job| format!("Sync {}: {}", job.status, job.message));
-    let auto_refresh = sync_message
-        .as_deref()
-        .is_some_and(|message| message.contains("queued") || message.contains("running"))
-        || threads
-            .iter()
-            .any(|thread| matches!(thread.state.as_str(), "Processing" | "Unprocessed"));
+    let threads = fetch_thread_views(&state.pool, session.user_id, selected_state).await?;
 
     render(InboxTemplate {
         threads,
         filters: filters(selected_filter),
         user_email: session.email,
-        sync_message,
-        auto_refresh,
+        syncing: sync_job_is_running(&state.pool, session.user_id).await?,
+    })
+}
+
+async fn inbox_table(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<InboxQuery>,
+) -> Result<Response, AppError> {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
+        return Ok(Redirect::to("/login").into_response());
+    };
+    let selected_filter = query.state.as_deref().unwrap_or("NeedsAction");
+    let selected_state = Some(selected_filter).filter(|value| *value != "all");
+    let threads = fetch_thread_views(&state.pool, session.user_id, selected_state).await?;
+
+    render(InboxTableTemplate { threads })
+}
+
+async fn sync_button(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
+        return Ok(Redirect::to("/login").into_response());
+    };
+    render(SyncButtonTemplate {
+        syncing: sync_job_is_running(&state.pool, session.user_id).await?,
     })
 }
 
@@ -431,6 +472,10 @@ async fn reset_synced_data(
     .execute(&state.pool)
     .await?;
     sqlx::query("DELETE FROM threads WHERE user_id = ?")
+        .bind(session.user_id)
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("DELETE FROM sync_jobs WHERE user_id = ?")
         .bind(session.user_id)
         .execute(&state.pool)
         .await?;
@@ -495,15 +540,12 @@ async fn thread(
     .fetch_all(&state.pool)
     .await?;
 
-    let auto_refresh = matches!(thread.state.as_str(), "Processing" | "Unprocessed");
-
     render(ThreadTemplate {
-        thread,
+        thread: ThreadView::from(thread),
         messages,
         form,
         logs,
         user_email: session.email,
-        auto_refresh,
     })
 }
 
@@ -596,7 +638,12 @@ async fn run_sync_job(state: AppState, session: UserSession, job_id: i64) -> Res
     match sync_latest_threads(&state, &session).await {
         Ok(()) => {
             update_sync_job(&state.pool, job_id, "done", "Gmail sync complete", true).await?;
-            eprintln!("sync_job: done job_id={job_id}");
+            eprintln!("sync_job: done job_id={job_id}; starting processor");
+            tokio::spawn(async move {
+                if let Err(error) = process_unprocessed_threads(state, session).await {
+                    eprintln!("processor: failed error={}", error.0);
+                }
+            });
             Ok(())
         }
         Err(error) => {
@@ -649,16 +696,44 @@ async fn update_sync_job(
     Ok(())
 }
 
-async fn latest_sync_job(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Option<SyncJobRow>, sqlx::Error> {
-    sqlx::query_as::<_, SyncJobRow>(
-        "SELECT status, message FROM sync_jobs WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+async fn sync_job_is_running(pool: &SqlitePool, user_id: i64) -> Result<bool, sqlx::Error> {
+    let status: Option<(String,)> = sqlx::query_as(
+        "SELECT status FROM sync_jobs
+         WHERE user_id = ?
+           AND (
+             (status = 'queued' AND created_at > datetime('now', '-30 seconds'))
+             OR (status = 'running' AND started_at > datetime('now', '-10 minutes'))
+           )
+         ORDER BY id DESC LIMIT 1",
     )
     .bind(user_id)
     .fetch_optional(pool)
-    .await
+    .await?;
+    Ok(status.is_some())
+}
+
+async fn fetch_thread_views(
+    pool: &SqlitePool,
+    user_id: i64,
+    selected_state: Option<&str>,
+) -> Result<Vec<ThreadView>, sqlx::Error> {
+    let thread_rows = if let Some(selected_state) = selected_state {
+        sqlx::query_as::<_, ThreadRow>(
+            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? AND state = ? ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .bind(selected_state)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, ThreadRow>(
+            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(thread_rows.into_iter().map(ThreadView::from).collect())
 }
 
 fn filters(selected: &str) -> Vec<FilterOption<'_>> {
@@ -677,6 +752,28 @@ fn filters(selected: &str) -> Vec<FilterOption<'_>> {
         selected: value == selected,
     })
     .collect()
+}
+
+fn state_label(state: &str) -> &'static str {
+    match state {
+        "NeedsAction" => "Needs Action",
+        "Unprocessed" => "Unprocessed",
+        "Processing" => "Processing",
+        "Waiting" => "Waiting",
+        "Resolved" => "Resolved",
+        _ => "Unknown",
+    }
+}
+
+fn state_class(state: &str) -> &'static str {
+    match state {
+        "NeedsAction" => "needs-action",
+        "Unprocessed" => "unprocessed",
+        "Processing" => "processing",
+        "Waiting" => "waiting",
+        "Resolved" => "resolved",
+        _ => "unknown",
+    }
 }
 
 async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<(), AppError> {
@@ -714,20 +811,10 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
             &state.pool,
             thread_id,
             "system",
-            "Queued classifier after Gmail sync",
+            "Queued processing after Gmail sync",
         )
         .await?;
-        eprintln!("gmail_sync: upserted local thread_id={thread_id}; starting classifier");
-        set_thread_state(
-            &state.pool,
-            thread_id,
-            "Processing",
-            "Classifier running",
-            None,
-        )
-        .await?;
-        run_classifier(state, session, thread_id).await?;
-        eprintln!("gmail_sync: finished processing local thread_id={thread_id}");
+        eprintln!("gmail_sync: upserted local thread_id={thread_id}; queued processing");
     }
 
     Ok(())
@@ -778,8 +865,14 @@ async fn upsert_gmail_thread(
          ON CONFLICT(user_id, gmail_thread_id) DO UPDATE SET
            subject = excluded.subject,
            from_display = excluded.from_display,
-           state = 'Unprocessed',
-           latest_action = 'Synced from Gmail',
+           state = CASE
+             WHEN threads.last_message_at IS NOT excluded.last_message_at THEN 'Unprocessed'
+             ELSE threads.state
+           END,
+           latest_action = CASE
+             WHEN threads.last_message_at IS NOT excluded.last_message_at THEN 'Synced from Gmail'
+             ELSE threads.latest_action
+           END,
            updated_at = CURRENT_TIMESTAMP,
            snippet = excluded.snippet,
            last_message_at = excluded.last_message_at",
@@ -829,6 +922,52 @@ async fn upsert_gmail_thread(
     .await?;
 
     Ok(thread_id)
+}
+
+async fn process_unprocessed_threads(
+    state: AppState,
+    session: UserSession,
+) -> Result<(), AppError> {
+    eprintln!(
+        "processor: start user_id={} email={}",
+        session.user_id, session.email
+    );
+    loop {
+        let Some(thread_id) = next_unprocessed_thread_id(&state.pool, session.user_id).await?
+        else {
+            eprintln!("processor: no unprocessed threads remain");
+            return Ok(());
+        };
+        if !claim_unprocessed_thread(&state.pool, thread_id).await? {
+            continue;
+        }
+        eprintln!("processor: claimed thread_id={thread_id}");
+        log_thread_event(&state.pool, thread_id, "system", "Processing started").await?;
+        run_classifier(&state, &session, thread_id).await?;
+    }
+}
+
+async fn next_unprocessed_thread_id(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM threads WHERE user_id = ? AND state = 'Unprocessed' ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+async fn claim_unprocessed_thread(pool: &SqlitePool, thread_id: i64) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE threads SET state = 'Processing', latest_action = 'Classifier running', waiting_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'Unprocessed'",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 async fn run_classifier(
@@ -1408,11 +1547,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         http: reqwest::Client::new(),
     };
     let app = Router::new()
+        .route("/static/style.css", get(style_css))
         .route("/login", get(login))
         .route("/login/google", get(google_start))
         .route("/login/google/callback", get(google_callback))
         .route("/logout", post(logout))
         .route("/sync", post(sync_gmail))
+        .route("/partials/inbox-table", get(inbox_table))
+        .route("/partials/sync-button", get(sync_button))
         .route("/", get(inbox))
         .route("/threads/{id}", get(thread))
         .route("/threads/{id}/submit", post(submit_thread_form))

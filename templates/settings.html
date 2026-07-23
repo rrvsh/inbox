@@ -1,25 +1,48 @@
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Settings</title></head>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Settings</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
   <body>
     <nav>
       <a href="/">Inbox</a> |
       <a href="/settings">Settings</a> |
       {{ user_email }}
+      <span class="spacer"></span>
       <form method="post" action="/logout" style="display: inline">
         <button type="submit">Logout</button>
       </form>
     </nav>
     <main>
       <h1>Settings</h1>
-      <form method="post" action="/settings">
-        <label for="openrouter_key">OpenRouter API key</label>
-        <input id="openrouter_key" name="openrouter_key" type="password" value="{{ openrouter_key }}">
-        <button type="submit">Save</button>
-      </form>
-      <form method="post" action="/settings/reset-data">
-        <button type="submit">Reset synced data</button>
-      </form>
+
+      <section class="card">
+        <h2>OpenRouter</h2>
+        <form method="post" action="/settings">
+          <p><label for="openrouter_key">OpenRouter API key</label></p>
+          <p><input id="openrouter_key" name="openrouter_key" type="password" value="{{ openrouter_key }}" style="width: min(520px, 100%);"></p>
+          <p class="muted">Stored by the backend and used for classifier and reply drafter calls.</p>
+          <button type="submit" class="primary">Save</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Gmail account</h2>
+        <p>Connected as <strong>{{ user_email }}</strong>.</p>
+        <p class="muted">Scopes: gmail.readonly, gmail.send.</p>
+        <a class="button" href="/login/google">Reconnect Google</a>
+      </section>
+
+      <section class="card danger">
+        <h2>Reset synced data</h2>
+        <p>This deletes local threads, messages, forms, and logs for this user. It keeps the account, session, tokens, and OpenRouter key.</p>
+        <form method="post" action="/settings/reset-data">
+          <button type="submit">Reset synced data</button>
+        </form>
+      </section>
     </main>
   </body>
 </html>

@@ -1,0 +1,29 @@
+<div id="inbox-table" hx-get="/partials/inbox-table" hx-trigger="every 3s" hx-include="#state" hx-swap="outerHTML">
+  <table>
+    <thead>
+      <tr>
+        <th>Thread</th>
+        <th>From</th>
+        <th>State</th>
+        <th>Latest action</th>
+        <th>Waiting until</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for thread in threads %}
+        <tr>
+          <td><a href="/threads/{{ thread.id }}">{{ thread.subject }}</a></td>
+          <td>{{ thread.from_display }}</td>
+          <td><span class="badge {{ thread.state_class }}">{{ thread.state_label }}</span></td>
+          <td>{{ thread.latest_action }}</td>
+          <td>{% match thread.waiting_until %}{% when Some with (value) %}{{ value }}{% when None %}{% endmatch %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if threads.len() == 0 %}
+    <section class="card">
+      <p>No threads in this view.</p>
+    </section>
+  {% endif %}
+</div>

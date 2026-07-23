@@ -1,61 +1,73 @@
 <!doctype html>
 <html>
   <head>
-    <meta charset="utf-8"><title>Inbox</title>
-    {% if auto_refresh %}<meta http-equiv="refresh" content="3">{% endif %}
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Inbox</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/htmx.org@2.0.7"></script>
   </head>
   <body>
     <nav>
       <a href="/">Inbox</a> |
       <a href="/settings">Settings</a> |
       {{ user_email }}
+      <span class="spacer"></span>
       <form method="post" action="/logout" style="display: inline">
         <button type="submit">Logout</button>
       </form>
     </nav>
     <main>
       <h1>Inbox</h1>
-      {% match sync_message %}
-        {% when Some with (message) %}
-          <p>{{ message }}</p>
-        {% when None %}
-      {% endmatch %}
-      {% if auto_refresh %}<p>Work is running. This page will refresh.</p>{% endif %}
-      <form method="post" action="/sync">
-        <button type="submit">Sync Gmail</button>
-      </form>
-      <form method="get" action="/">
-        <label for="state">Status</label>
-        <select id="state" name="state">
-          {% for option in filters %}
-            <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
-          {% endfor %}
-        </select>
-        <button type="submit">Filter</button>
-      </form>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Thread</th>
-            <th>From</th>
-            <th>State</th>
-            <th>Latest action</th>
-            <th>Waiting until</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for thread in threads %}
+      <div class="toolbar">
+        <form id="sync-button" method="post" action="/sync" hx-get="/partials/sync-button" hx-trigger="every 3s" hx-swap="outerHTML">
+          {% if syncing %}
+            <button type="submit" class="primary" disabled>Syncing…</button>
+          {% else %}
+            <button type="submit" class="primary">Sync Gmail</button>
+          {% endif %}
+        </form>
+        <form method="get" action="/">
+          <label for="state">Status</label>
+          <select id="state" name="state">
+            {% for option in filters %}
+              <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Filter</button>
+        </form>
+      </div>
+
+      <div id="inbox-table" hx-get="/partials/inbox-table" hx-trigger="every 3s" hx-include="#state" hx-swap="outerHTML">
+        <table>
+          <thead>
             <tr>
-              <td><a href="/threads/{{ thread.id }}">{{ thread.subject }}</a></td>
-              <td>{{ thread.from_display }}</td>
-              <td>{{ thread.state }}</td>
-              <td>{{ thread.latest_action }}</td>
-              <td>{% match thread.waiting_until %}{% when Some with (value) %}{{ value }}{% when None %}{% endmatch %}</td>
+              <th>Thread</th>
+              <th>From</th>
+              <th>State</th>
+              <th>Latest action</th>
+              <th>Waiting until</th>
             </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {% for thread in threads %}
+              <tr>
+                <td><a href="/threads/{{ thread.id }}">{{ thread.subject }}</a></td>
+                <td>{{ thread.from_display }}</td>
+                <td><span class="badge {{ thread.state_class }}">{{ thread.state_label }}</span></td>
+                <td>{{ thread.latest_action }}</td>
+                <td>{% match thread.waiting_until %}{% when Some with (value) %}{{ value }}{% when None %}{% endmatch %}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% if threads.len() == 0 %}
+          <section class="card">
+            <p>No threads in this view.</p>
+          </section>
+        {% endif %}
+      </div>
     </main>
   </body>
 </html>
