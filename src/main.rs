@@ -55,6 +55,7 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
+#[derive(Clone)]
 struct UserSession {
     user_id: i64,
     email: String,
@@ -91,6 +92,12 @@ struct ActionLogRow {
     actor: String,
     message: String,
     created_at: String,
+}
+
+#[derive(FromRow)]
+struct SyncJobRow {
+    status: String,
+    message: String,
 }
 
 struct FilterOption<'a> {
@@ -200,6 +207,8 @@ struct InboxTemplate<'a> {
     threads: Vec<ThreadRow>,
     filters: Vec<FilterOption<'a>>,
     user_email: String,
+    sync_message: Option<String>,
+    auto_refresh: bool,
 }
 
 #[derive(Template)]
@@ -210,6 +219,7 @@ struct ThreadTemplate {
     form: Option<UserFormRow>,
     logs: Vec<ActionLogRow>,
     user_email: String,
+    auto_refresh: bool,
 }
 
 #[derive(Template)]
@@ -346,10 +356,21 @@ async fn inbox(
         .await?
     };
 
+    let sync_job = latest_sync_job(&state.pool, session.user_id).await?;
+    let sync_message = sync_job.map(|job| format!("Sync {}: {}", job.status, job.message));
+    let auto_refresh = sync_message
+        .as_deref()
+        .is_some_and(|message| message.contains("queued") || message.contains("running"))
+        || threads
+            .iter()
+            .any(|thread| matches!(thread.state.as_str(), "Processing" | "Unprocessed"));
+
     render(InboxTemplate {
         threads,
         filters: filters(query.state.as_deref().unwrap_or("all")),
         user_email: session.email,
+        sync_message,
+        auto_refresh,
     })
 }
 
@@ -424,12 +445,17 @@ async fn sync_gmail(
         return Ok(Redirect::to("/login"));
     };
 
+    let job_id = create_sync_job(&state.pool, session.user_id).await?;
     eprintln!(
-        "sync_route: started for user_id={} email={}",
+        "sync_route: queued job_id={job_id} for user_id={} email={}",
         session.user_id, session.email
     );
-    sync_latest_threads(&state, &session).await?;
-    eprintln!("sync_route: completed for user_id={}", session.user_id);
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_sync_job(worker_state, session, job_id).await {
+            eprintln!("sync_job: failed job_id={job_id} error={}", error.0);
+        }
+    });
     Ok(Redirect::to("/"))
 }
 
@@ -468,12 +494,15 @@ async fn thread(
     .fetch_all(&state.pool)
     .await?;
 
+    let auto_refresh = matches!(thread.state.as_str(), "Processing" | "Unprocessed");
+
     render(ThreadTemplate {
         thread,
         messages,
         form,
         logs,
         user_email: session.email,
+        auto_refresh,
     })
 }
 
@@ -555,6 +584,80 @@ async fn submit_thread_form(
     Ok(Redirect::to(&format!("/threads/{id}")))
 }
 
+async fn run_sync_job(state: AppState, session: UserSession, job_id: i64) -> Result<(), AppError> {
+    update_sync_job(&state.pool, job_id, "running", "Starting Gmail sync", false).await?;
+    eprintln!(
+        "sync_job: running job_id={job_id} user_id={} email={}",
+        session.user_id, session.email
+    );
+    match sync_latest_threads(&state, &session).await {
+        Ok(()) => {
+            update_sync_job(&state.pool, job_id, "done", "Gmail sync complete", true).await?;
+            eprintln!("sync_job: done job_id={job_id}");
+            Ok(())
+        }
+        Err(error) => {
+            update_sync_job(&state.pool, job_id, "failed", &error.0, true).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn create_sync_job(pool: &SqlitePool, user_id: i64) -> Result<i64, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sync_jobs (user_id, status, message) VALUES (?, 'queued', 'Sync queued')",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    let (job_id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+        .fetch_one(pool)
+        .await?;
+    Ok(job_id)
+}
+
+async fn update_sync_job(
+    pool: &SqlitePool,
+    job_id: i64,
+    status: &str,
+    message: &str,
+    completed: bool,
+) -> Result<(), sqlx::Error> {
+    eprintln!("sync_job: update job_id={job_id} status={status} message={message}");
+    if completed {
+        sqlx::query(
+            "UPDATE sync_jobs SET status = ?, message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(status)
+        .bind(message)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE sync_jobs SET status = ?, message = ?, started_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(status)
+        .bind(message)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn latest_sync_job(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Option<SyncJobRow>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJobRow>(
+        "SELECT status, message FROM sync_jobs WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
 fn filters(selected: &str) -> Vec<FilterOption<'_>> {
     [
         ("NeedsAction", "Needs Action"),
@@ -604,6 +707,13 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
             gmail_thread.messages.len()
         );
         let thread_id = upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+        log_thread_event(
+            &state.pool,
+            thread_id,
+            "system",
+            "Queued classifier after Gmail sync",
+        )
+        .await?;
         eprintln!("gmail_sync: upserted local thread_id={thread_id}; starting classifier");
         set_thread_state(
             &state.pool,
@@ -758,13 +868,13 @@ async fn run_classifier(
         "classifier: calling OpenRouter thread_id={thread_id} prompt_bytes={}",
         prompt.len()
     );
-    let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
-    eprintln!(
-        "classifier: model response thread_id={thread_id} bytes={} preview={}",
-        model_response.len(),
-        preview(&model_response)
-    );
-    let output = parse_json_content::<ClassifierOutput>(&model_response)?;
+    let output = call_openrouter_json::<ClassifierOutput>(
+        &state.http,
+        openrouter_key,
+        &prompt,
+        "Return exactly one JSON object: {\"decision\":\"needs_reply\"} OR {\"decision\":\"waiting\",\"reason\":\"...\",\"wake_date\":\"YYYY-MM-DD\"} OR {\"decision\":\"ask_to_resolve\",\"reason\":\"...\"}.",
+    )
+    .await?;
 
     match output {
         ClassifierOutput::NeedsReply => {
@@ -866,13 +976,13 @@ async fn run_reply_drafter(
         "reply_drafter: calling OpenRouter thread_id={thread_id} prompt_bytes={}",
         prompt.len()
     );
-    let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
-    eprintln!(
-        "reply_drafter: model response thread_id={thread_id} bytes={} preview={}",
-        model_response.len(),
-        preview(&model_response)
-    );
-    let output = parse_json_content::<DraftOutput>(&model_response)?;
+    let output = call_openrouter_json::<DraftOutput>(
+        &state.http,
+        openrouter_key,
+        &prompt,
+        "Return exactly one JSON object: {\"draft\":\"...\"}.",
+    )
+    .await?;
     eprintln!(
         "reply_drafter: parsed draft thread_id={thread_id} bytes={}",
         output.draft.len()
@@ -905,42 +1015,97 @@ async fn run_reply_drafter(
     Ok(())
 }
 
+async fn call_openrouter_json<T>(
+    http: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+    schema_hint: &str,
+) -> Result<T, AppError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut current_prompt = prompt.to_owned();
+    let mut last_error = String::new();
+
+    for attempt in 1..=3 {
+        eprintln!("agent_json: attempt={attempt}");
+        let model_response = call_openrouter(http, api_key, &current_prompt).await?;
+        eprintln!(
+            "agent_json: response attempt={attempt} bytes={} preview={}",
+            model_response.len(),
+            preview(&model_response)
+        );
+        match parse_json_content::<T>(&model_response) {
+            Ok(output) => return Ok(output),
+            Err(error) => {
+                last_error = error.0;
+                eprintln!("agent_json: parse_failed attempt={attempt} error={last_error}");
+                current_prompt = format!(
+                    "{prompt}\n\nYour previous response was invalid. {schema_hint}\nParse error: {last_error}\nPrevious response: {model_response}\nReturn corrected JSON only."
+                );
+            }
+        }
+    }
+
+    Err(AppError(format!(
+        "agent returned invalid JSON after retries: {last_error}"
+    )))
+}
+
 async fn call_openrouter(
     http: &reqwest::Client,
     api_key: &str,
     prompt: &str,
 ) -> Result<String, AppError> {
-    eprintln!(
-        "openrouter: request model=nvidia/nemotron-3-ultra-550b-a55b:free prompt_bytes={}",
-        prompt.len()
-    );
-    let response = http
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(api_key)
-        .json(&serde_json::json!({
-            "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "messages": [{ "role": "user", "content": prompt }]
-        }))
-        .send()
-        .await?;
-    let status = response.status();
-    eprintln!("openrouter: response status={status}");
-    if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
-        return Err(AppError(format!(
-            "OpenRouter request failed status={status} body={}",
-            preview(&body)
-        )));
+    let models = [
+        "inclusionai/ling-3.0-flash:free",
+        "google/gemma-4-31b-it:free",
+    ];
+    let mut last_error = String::new();
+
+    for model in models {
+        eprintln!(
+            "openrouter: request model={model} prompt_bytes={}",
+            prompt.len()
+        );
+        let response = http
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": prompt }]
+            }))
+            .send()
+            .await?;
+        let status = response.status();
+        eprintln!("openrouter: response model={model} status={status}");
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+            last_error = format!(
+                "OpenRouter request failed model={model} status={status} body={}",
+                preview(&body)
+            );
+            eprintln!("openrouter: {last_error}");
+            continue;
+        }
+
+        let value = response.json::<serde_json::Value>().await?;
+        eprintln!("openrouter: response JSON parsed model={model}");
+        if let Some(content) = value["choices"][0]["message"]["content"].as_str() {
+            return Ok(content.to_owned());
+        }
+
+        last_error = format!(
+            "OpenRouter response missing content model={model} body={}",
+            preview(&value.to_string())
+        );
+        eprintln!("openrouter: {last_error}");
     }
-    let value = response.json::<serde_json::Value>().await?;
-    eprintln!("openrouter: response JSON parsed");
-    value["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| AppError("OpenRouter response missing content".to_owned()))
+
+    Err(AppError(last_error))
 }
 
 fn preview(text: &str) -> String {

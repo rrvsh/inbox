@@ -1,6 +1,9 @@
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Inbox</title></head>
+  <head>
+    <meta charset="utf-8"><title>Inbox</title>
+    {% if auto_refresh %}<meta http-equiv="refresh" content="3">{% endif %}
+  </head>
   <body>
     <nav>
       <a href="/">Inbox</a> |
@@ -12,6 +15,12 @@
     </nav>
     <main>
       <h1>Inbox</h1>
+      {% match sync_message %}
+        {% when Some with (message) %}
+          <p>{{ message }}</p>
+        {% when None %}
+      {% endmatch %}
+      {% if auto_refresh %}<p>Work is running. This page will refresh.</p>{% endif %}
       <form method="post" action="/sync">
         <button type="submit">Sync Gmail</button>
       </form>
