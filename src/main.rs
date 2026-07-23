@@ -9,7 +9,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE};
 use reqwest::Url;
 use sqlx::{FromRow, SqlitePool, sqlite::SqliteConnectOptions};
-use std::{env, error::Error, net::SocketAddr, str::FromStr};
+use std::{env, error::Error, fmt::Write, net::SocketAddr, str::FromStr};
 
 const SESSION_COOKIE: &str = "inbox_session";
 
@@ -58,6 +58,7 @@ struct UserSession {
     user_id: i64,
     email: String,
     access_token: String,
+    openrouter_key: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -79,6 +80,7 @@ struct MessageRow {
 
 #[derive(FromRow)]
 struct UserFormRow {
+    form_type: String,
     title: String,
     body: String,
 }
@@ -109,7 +111,13 @@ struct GoogleCallbackQuery {
 
 #[derive(serde::Deserialize)]
 struct UserSubmission {
+    action: String,
     response: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SettingsSubmission {
+    openrouter_key: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -201,6 +209,26 @@ struct ThreadTemplate {
     user_email: String,
 }
 
+#[derive(Template)]
+#[template(path = "settings.html")]
+struct SettingsTemplate {
+    user_email: String,
+    openrouter_key: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum ClassifierOutput {
+    NeedsReply,
+    Waiting { reason: String },
+    AskToResolve { reason: String },
+}
+
+#[derive(serde::Deserialize)]
+struct DraftOutput {
+    draft: String,
+}
+
 fn render(template: impl Template) -> Result<Response, AppError> {
     let html = template.render()?;
     Ok(Html(html).into_response())
@@ -251,6 +279,7 @@ async fn google_callback(
             user_id,
             email: email.clone(),
             access_token: token.access_token.clone(),
+            openrouter_key: None,
         },
     )
     .await?;
@@ -322,12 +351,28 @@ async fn settings(headers: HeaderMap, State(state): State<AppState>) -> Result<R
         return Ok(Redirect::to("/login").into_response());
     };
 
-    render(PageTemplate {
-        title: "Settings",
-        heading: "Settings",
-        body: "OpenRouter API key settings will be wired here.",
-        user_email: &session.email,
+    render(SettingsTemplate {
+        user_email: session.email,
+        openrouter_key: session.openrouter_key.unwrap_or_default(),
     })
+}
+
+async fn save_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Form(submission): Form<SettingsSubmission>,
+) -> Result<Redirect, AppError> {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
+        return Ok(Redirect::to("/login"));
+    };
+
+    sqlx::query("UPDATE users SET openrouter_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(submission.openrouter_key.trim())
+        .bind(session.user_id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Redirect::to("/settings"))
 }
 
 async fn sync_gmail(
@@ -365,7 +410,7 @@ async fn thread(
     .fetch_all(&state.pool)
     .await?;
     let form = sqlx::query_as::<_, UserFormRow>(
-        "SELECT title, body FROM user_forms WHERE thread_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        "SELECT form_type, title, body FROM user_forms WHERE thread_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -407,31 +452,62 @@ async fn submit_thread_form(
         return Ok(Redirect::to("/"));
     }
 
+    let form = sqlx::query_as::<_, (String,)>(
+        "SELECT form_type FROM user_forms WHERE thread_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
     sqlx::query(
         "UPDATE user_forms SET status = 'submitted' WHERE thread_id = ? AND status = 'active'",
     )
     .bind(id)
     .execute(&state.pool)
     .await?;
-    sqlx::query(
-        "UPDATE threads SET state = 'Resolved', latest_action = 'User submitted response', updated_at = '2026-07-23T00:00:00Z' WHERE id = ?",
+    log_thread_event(
+        &state.pool,
+        id,
+        "user",
+        &format!("Submitted {}: {}", submission.action, submission.response),
     )
-    .bind(id)
-    .execute(&state.pool)
     .await?;
-    sqlx::query(
-        "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES (?, 'user', ?, '2026-07-23T00:00:00Z')",
-    )
-    .bind(id)
-    .bind(format!("Submitted response: {}", submission.response))
-    .execute(&state.pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES (?, 'system', 'State changed to Resolved', '2026-07-23T00:00:01Z')",
-    )
-    .bind(id)
-    .execute(&state.pool)
-    .await?;
+
+    match (
+        form.as_ref().map(|(form_type,)| form_type.as_str()),
+        submission.action.as_str(),
+    ) {
+        (Some("AskToResolve"), "resolve") => {
+            set_thread_state(&state.pool, id, "Resolved", "User confirmed resolved", None).await?;
+            log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
+        }
+        (Some("DraftReply"), "comment") => {
+            set_thread_state(&state.pool, id, "Processing", "Revising draft reply", None).await?;
+            run_reply_drafter(&state, &session, id, Some(&submission.response)).await?;
+        }
+        (Some("DraftReply"), "send") => {
+            create_user_form(
+                &state.pool,
+                id,
+                "AskUser",
+                "Sending not implemented yet",
+                "Gmail send is not wired yet. Copy the draft into Gmail for now, then comment here when handled.",
+            )
+            .await?;
+            set_thread_state(
+                &state.pool,
+                id,
+                "NeedsAction",
+                "Gmail send not implemented",
+                None,
+            )
+            .await?;
+        }
+        _ => {
+            set_thread_state(&state.pool, id, "Processing", "Classifier running", None).await?;
+            run_classifier(&state, &session, id).await?;
+        }
+    }
 
     Ok(Redirect::to(&format!("/threads/{id}")))
 }
@@ -466,7 +542,8 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
 
     for thread in threads.threads.unwrap_or_default() {
         let gmail_thread = fetch_gmail_thread(state, session, &thread.id).await?;
-        upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+        let thread_id = upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+        run_classifier(state, session, thread_id).await?;
     }
 
     Ok(())
@@ -494,7 +571,7 @@ async fn upsert_gmail_thread(
     pool: &SqlitePool,
     user_id: i64,
     gmail_thread: &GmailThreadResponse,
-) -> Result<(), sqlx::Error> {
+) -> Result<i64, sqlx::Error> {
     let first_message = gmail_thread.messages.first();
     let last_message = gmail_thread.messages.last();
     let subject = first_message
@@ -511,6 +588,7 @@ async fn upsert_gmail_thread(
          ON CONFLICT(user_id, gmail_thread_id) DO UPDATE SET
            subject = excluded.subject,
            from_display = excluded.from_display,
+           state = 'Processing',
            latest_action = 'Synced from Gmail',
            updated_at = CURRENT_TIMESTAMP,
            snippet = excluded.snippet,
@@ -560,6 +638,274 @@ async fn upsert_gmail_thread(
     .execute(pool)
     .await?;
 
+    Ok(thread_id)
+}
+
+async fn run_classifier(
+    state: &AppState,
+    session: &UserSession,
+    thread_id: i64,
+) -> Result<(), AppError> {
+    let Some(openrouter_key) = session.openrouter_key.as_deref() else {
+        create_user_form(
+            &state.pool,
+            thread_id,
+            "AskUser",
+            "OpenRouter key required",
+            "Add your OpenRouter API key in Settings, then sync again.",
+        )
+        .await?;
+        set_thread_state(
+            &state.pool,
+            thread_id,
+            "NeedsAction",
+            "OpenRouter key required",
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    log_thread_event(&state.pool, thread_id, "agent", "Classifier started").await?;
+    let context = thread_context(&state.pool, thread_id).await?;
+    let prompt = format!(
+        "Classify this email thread. Return only JSON matching one of: {{\"decision\":\"needs_reply\"}}, {{\"decision\":\"waiting\",\"reason\":\"...\"}}, {{\"decision\":\"ask_to_resolve\",\"reason\":\"...\"}}. The classifier cannot directly resolve threads.\n\n{context}"
+    );
+    let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
+    let output = parse_json_content::<ClassifierOutput>(&model_response)?;
+
+    match output {
+        ClassifierOutput::NeedsReply => {
+            set_thread_state(&state.pool, thread_id, "Processing", "Drafting reply", None).await?;
+            run_reply_drafter(state, session, thread_id, None).await?;
+        }
+        ClassifierOutput::Waiting { reason } => {
+            set_thread_state(
+                &state.pool,
+                thread_id,
+                "Waiting",
+                &format!("Waiting: {reason}"),
+                None,
+            )
+            .await?;
+            log_thread_event(
+                &state.pool,
+                thread_id,
+                "agent",
+                &format!("Classifier set Waiting: {reason}"),
+            )
+            .await?;
+        }
+        ClassifierOutput::AskToResolve { reason } => {
+            create_user_form(
+                &state.pool,
+                thread_id,
+                "AskToResolve",
+                "Can this be resolved?",
+                &reason,
+            )
+            .await?;
+            set_thread_state(
+                &state.pool,
+                thread_id,
+                "NeedsAction",
+                "Confirm resolved",
+                None,
+            )
+            .await?;
+            log_thread_event(
+                &state.pool,
+                thread_id,
+                "agent",
+                "Classifier asked user to resolve",
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_reply_drafter(
+    state: &AppState,
+    session: &UserSession,
+    thread_id: i64,
+    instruction: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(openrouter_key) = session.openrouter_key.as_deref() else {
+        create_user_form(
+            &state.pool,
+            thread_id,
+            "AskUser",
+            "OpenRouter key required",
+            "Add your OpenRouter API key in Settings, then sync again.",
+        )
+        .await?;
+        set_thread_state(
+            &state.pool,
+            thread_id,
+            "NeedsAction",
+            "OpenRouter key required",
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    log_thread_event(&state.pool, thread_id, "agent", "Reply drafter started").await?;
+    let context = thread_context(&state.pool, thread_id).await?;
+    let instruction = instruction.unwrap_or("Draft a concise helpful reply.");
+    let prompt = format!(
+        "Draft an email reply for this thread. Return only JSON: {{\"draft\":\"...\"}}. User instruction: {instruction}\n\n{context}"
+    );
+    let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
+    let output = parse_json_content::<DraftOutput>(&model_response)?;
+
+    create_user_form(
+        &state.pool,
+        thread_id,
+        "DraftReply",
+        "Review draft reply",
+        &output.draft,
+    )
+    .await?;
+    set_thread_state(
+        &state.pool,
+        thread_id,
+        "NeedsAction",
+        "Review draft reply",
+        None,
+    )
+    .await?;
+    log_thread_event(
+        &state.pool,
+        thread_id,
+        "agent",
+        "Reply drafter created draft form",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn call_openrouter(
+    http: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+) -> Result<String, AppError> {
+    let response = http
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({
+            "model": "openai/gpt-4o-mini",
+            "messages": [{ "role": "user", "content": prompt }]
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let value = response.json::<serde_json::Value>().await?;
+    value["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError("OpenRouter response missing content".to_owned()))
+}
+
+fn parse_json_content<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, AppError> {
+    let trimmed = content.trim();
+    let json_text = trimmed
+        .strip_prefix("```json")
+        .and_then(|text| text.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    serde_json::from_str(json_text)
+        .map_err(|error| AppError(format!("agent returned invalid JSON: {error}: {content}")))
+}
+
+async fn thread_context(pool: &SqlitePool, thread_id: i64) -> Result<String, sqlx::Error> {
+    let thread = sqlx::query_as::<_, ThreadRow>(
+        "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE id = ?",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await?;
+    let messages = sqlx::query_as::<_, MessageRow>(
+        "SELECT sender, body, sent_at FROM messages WHERE thread_id = ? ORDER BY sent_at ASC",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await?;
+    let mut context = format!(
+        "Subject: {}\nFrom: {}\n",
+        thread.subject, thread.from_display
+    );
+    for message in messages {
+        write!(
+            context,
+            "\nMessage from {} at {}:\n{}\n",
+            message.sender, message.sent_at, message.body
+        )
+        .expect("writing to string cannot fail");
+    }
+    Ok(context)
+}
+
+async fn create_user_form(
+    pool: &SqlitePool,
+    thread_id: i64,
+    form_type: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE user_forms SET status = 'superseded' WHERE thread_id = ? AND status = 'active'",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_forms (thread_id, form_type, title, body, status, created_at) VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)",
+    )
+    .bind(thread_id)
+    .bind(form_type)
+    .bind(title)
+    .bind(body)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn set_thread_state(
+    pool: &SqlitePool,
+    thread_id: i64,
+    state: &str,
+    latest_action: &str,
+    waiting_until: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE threads SET state = ?, latest_action = ?, waiting_until = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(state)
+    .bind(latest_action)
+    .bind(waiting_until)
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn log_thread_event(
+    pool: &SqlitePool,
+    thread_id: i64,
+    actor: &str,
+    message: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(thread_id)
+    .bind(actor)
+    .bind(message)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -678,17 +1024,20 @@ async fn require_user_session(
     let Some(token) = session_token_from_headers(headers) else {
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, (i64, String, String)>(
-        "SELECT users.id, users.google_email, users.access_token FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
+    let row = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
+        "SELECT users.id, users.google_email, users.access_token, users.openrouter_key FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
     )
     .bind(token)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(user_id, email, access_token)| UserSession {
-        user_id,
-        email,
-        access_token,
-    }))
+    Ok(row.map(
+        |(user_id, email, access_token, openrouter_key)| UserSession {
+            user_id,
+            email,
+            access_token,
+            openrouter_key,
+        },
+    ))
 }
 
 fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -747,7 +1096,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/", get(inbox))
         .route("/threads/{id}", get(thread))
         .route("/threads/{id}/submit", post(submit_thread_form))
-        .route("/settings", get(settings))
+        .route("/settings", get(settings).post(save_settings))
         .with_state(app_state);
 
     let address = SocketAddr::from(([127, 0, 0, 1], 3000));

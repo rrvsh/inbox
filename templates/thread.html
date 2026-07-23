@@ -29,8 +29,18 @@
             <h3>{{ active_form.title }}</h3>
             <p>{{ active_form.body }}</p>
             <form method="post" action="/threads/{{ thread.id }}/submit">
-              <textarea name="response" rows="6" cols="80"></textarea>
-              <p><button type="submit">Submit</button></p>
+              <textarea name="response" rows="6" cols="80">{{ active_form.body }}</textarea>
+              <p>
+                {% if active_form.form_type == "AskToResolve" %}
+                  <button type="submit" name="action" value="resolve">Resolve</button>
+                  <button type="submit" name="action" value="comment">Not resolved / comment</button>
+                {% else if active_form.form_type == "DraftReply" %}
+                  <button type="submit" name="action" value="comment">Revise with comment</button>
+                  <button type="submit" name="action" value="send">Send later</button>
+                {% else %}
+                  <button type="submit" name="action" value="comment">Submit</button>
+                {% endif %}
+              </p>
             </form>
           </section>
         {% when None %}

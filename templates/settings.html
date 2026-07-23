@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Settings</title></head>
+  <body>
+    <nav>
+      <a href="/">Inbox</a> |
+      <a href="/settings">Settings</a> |
+      {{ user_email }}
+      <form method="post" action="/logout" style="display: inline">
+        <button type="submit">Logout</button>
+      </form>
+    </nav>
+    <main>
+      <h1>Settings</h1>
+      <form method="post" action="/settings">
+        <label for="openrouter_key">OpenRouter API key</label>
+        <input id="openrouter_key" name="openrouter_key" type="password" value="{{ openrouter_key }}">
+        <button type="submit">Save</button>
+      </form>
+    </main>
+  </body>
+</html>
