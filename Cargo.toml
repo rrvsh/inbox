@@ -7,4 +7,6 @@ rust-version = "1.88"
 [dependencies]
 askama = "0.16.0"
 axum = "0.8.9"
+serde = { version = "1.0.229", features = ["derive"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
 tokio = { version = "1.53.1", features = ["full"] }

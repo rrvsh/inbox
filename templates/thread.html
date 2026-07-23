@@ -1,6 +1,6 @@
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Thread {{ id }}</title></head>
+  <head><meta charset="utf-8"><title>{{ thread.subject }}</title></head>
   <body>
     <nav>
       <a href="/">Inbox</a> |
@@ -9,8 +9,45 @@
     </nav>
     <main>
       <p><a href="/">Back to inbox</a></p>
-      <h1>Thread {{ id }}</h1>
-      <p>Thread detail placeholder.</p>
+      <h1>{{ thread.subject }}</h1>
+      <dl>
+        <dt>From</dt>
+        <dd>{{ thread.from_display }}</dd>
+        <dt>State</dt>
+        <dd>{{ thread.state }}</dd>
+        <dt>Latest action</dt>
+        <dd>{{ thread.latest_action }}</dd>
+      </dl>
+
+      <h2>Active form</h2>
+      {% match form %}
+        {% when Some with (active_form) %}
+          <section>
+            <h3>{{ active_form.title }}</h3>
+            <p>{{ active_form.body }}</p>
+            <form method="post" action="/threads/{{ thread.id }}/submit">
+              <textarea name="response" rows="6" cols="80"></textarea>
+              <p><button type="submit">Submit</button></p>
+            </form>
+          </section>
+        {% when None %}
+          <p>No active form.</p>
+      {% endmatch %}
+
+      <h2>Messages</h2>
+      {% for message in messages %}
+        <article>
+          <h3>{{ message.sender }} — {{ message.sent_at }}</h3>
+          <p>{{ message.body }}</p>
+        </article>
+      {% endfor %}
+
+      <h2>Action log</h2>
+      <ol>
+        {% for entry in logs %}
+          <li>{{ entry.created_at }} — {{ entry.actor }} — {{ entry.message }}</li>
+        {% endfor %}
+      </ol>
     </main>
   </body>
 </html>

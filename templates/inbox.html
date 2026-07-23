@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Inbox</title></head>
+  <body>
+    <nav>
+      <a href="/">Inbox</a> |
+      <a href="/settings">Settings</a> |
+      <a href="/login">Login</a>
+    </nav>
+    <main>
+      <h1>Inbox</h1>
+      <form method="get" action="/">
+        <label for="state">Status</label>
+        <select id="state" name="state">
+          {% for option in filters %}
+            <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit">Filter</button>
+      </form>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Thread</th>
+            <th>From</th>
+            <th>State</th>
+            <th>Latest action</th>
+            <th>Waiting until</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for thread in threads %}
+            <tr>
+              <td><a href="/threads/{{ thread.id }}">{{ thread.subject }}</a></td>
+              <td>{{ thread.from_display }}</td>
+              <td>{{ thread.state }}</td>
+              <td>{{ thread.latest_action }}</td>
+              <td>{% match thread.waiting_until %}{% when Some with (value) %}{{ value }}{% when None %}{% endmatch %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>
