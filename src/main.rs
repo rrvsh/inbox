@@ -6,6 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE};
 use reqwest::Url;
 use sqlx::{FromRow, SqlitePool, sqlite::SqliteConnectOptions};
 use std::{env, error::Error, net::SocketAddr, str::FromStr};
@@ -56,6 +57,7 @@ impl From<reqwest::Error> for AppError {
 struct UserSession {
     user_id: i64,
     email: String,
+    access_token: String,
 }
 
 #[derive(FromRow)]
@@ -121,6 +123,51 @@ struct GoogleTokenResponse {
 struct GmailProfileResponse {
     #[serde(rename = "emailAddress")]
     email_address: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailThreadsResponse {
+    threads: Option<Vec<GmailThreadStub>>,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailThreadStub {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailThreadResponse {
+    id: String,
+    snippet: Option<String>,
+    messages: Vec<GmailMessage>,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailMessage {
+    id: String,
+    #[serde(rename = "internalDate")]
+    internal_date: Option<String>,
+    payload: GmailPayload,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailPayload {
+    headers: Vec<GmailHeader>,
+    body: Option<GmailBody>,
+    parts: Option<Vec<Self>>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailBody {
+    data: Option<String>,
 }
 
 #[derive(Template)]
@@ -198,7 +245,15 @@ async fn google_callback(
     let token = exchange_google_code(&state, &code).await?;
     let email = fetch_gmail_profile_email(&state, &token.access_token).await?;
     let user_id = upsert_user(&state.pool, &email, &token).await?;
-    seed_mock_data(&state.pool, user_id).await?;
+    sync_latest_threads(
+        &state,
+        &UserSession {
+            user_id,
+            email: email.clone(),
+            access_token: token.access_token.clone(),
+        },
+    )
+    .await?;
     let session_token = create_session(&state.pool, user_id).await?;
 
     let mut response = Redirect::to("/").into_response();
@@ -237,8 +292,6 @@ async fn inbox(
     let Some(session) = require_user_session(&headers, &state.pool).await? else {
         return Ok(Redirect::to("/login").into_response());
     };
-    seed_mock_data(&state.pool, session.user_id).await?;
-
     let selected_state = query.state.as_deref().filter(|value| *value != "all");
     let threads = if let Some(selected_state) = selected_state {
         sqlx::query_as::<_, ThreadRow>(
@@ -275,6 +328,18 @@ async fn settings(headers: HeaderMap, State(state): State<AppState>) -> Result<R
         body: "OpenRouter API key settings will be wired here.",
         user_email: &session.email,
     })
+}
+
+async fn sync_gmail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Redirect, AppError> {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
+        return Ok(Redirect::to("/login"));
+    };
+
+    sync_latest_threads(&state, &session).await?;
+    Ok(Redirect::to("/"))
 }
 
 async fn thread(
@@ -388,6 +453,149 @@ fn filters(selected: &str) -> Vec<FilterOption<'_>> {
     .collect()
 }
 
+async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<(), AppError> {
+    let response = state
+        .http
+        .get("https://gmail.googleapis.com/gmail/v1/users/me/threads")
+        .bearer_auth(&session.access_token)
+        .query(&[("maxResults", "10")])
+        .send()
+        .await?
+        .error_for_status()?;
+    let threads = response.json::<GmailThreadsResponse>().await?;
+
+    for thread in threads.threads.unwrap_or_default() {
+        let gmail_thread = fetch_gmail_thread(state, session, &thread.id).await?;
+        upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+    }
+
+    Ok(())
+}
+
+async fn fetch_gmail_thread(
+    state: &AppState,
+    session: &UserSession,
+    gmail_thread_id: &str,
+) -> Result<GmailThreadResponse, AppError> {
+    let response = state
+        .http
+        .get(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/threads/{gmail_thread_id}"
+        ))
+        .bearer_auth(&session.access_token)
+        .query(&[("format", "full")])
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json::<GmailThreadResponse>().await?)
+}
+
+async fn upsert_gmail_thread(
+    pool: &SqlitePool,
+    user_id: i64,
+    gmail_thread: &GmailThreadResponse,
+) -> Result<(), sqlx::Error> {
+    let first_message = gmail_thread.messages.first();
+    let last_message = gmail_thread.messages.last();
+    let subject = first_message
+        .and_then(|message| header_value(&message.payload.headers, "Subject"))
+        .unwrap_or("(no subject)");
+    let from_display = last_message
+        .and_then(|message| header_value(&message.payload.headers, "From"))
+        .unwrap_or("(unknown sender)");
+    let last_message_at = last_message.and_then(|message| message.internal_date.as_deref());
+
+    sqlx::query(
+        "INSERT INTO threads (user_id, gmail_thread_id, subject, from_display, state, latest_action, waiting_until, updated_at, snippet, last_message_at)
+         VALUES (?, ?, ?, ?, 'Processing', 'Synced from Gmail', NULL, CURRENT_TIMESTAMP, ?, ?)
+         ON CONFLICT(user_id, gmail_thread_id) DO UPDATE SET
+           subject = excluded.subject,
+           from_display = excluded.from_display,
+           latest_action = 'Synced from Gmail',
+           updated_at = CURRENT_TIMESTAMP,
+           snippet = excluded.snippet,
+           last_message_at = excluded.last_message_at",
+    )
+    .bind(user_id)
+    .bind(&gmail_thread.id)
+    .bind(subject)
+    .bind(from_display)
+    .bind(gmail_thread.snippet.as_deref())
+    .bind(last_message_at)
+    .execute(pool)
+    .await?;
+
+    let (thread_id,): (i64,) =
+        sqlx::query_as("SELECT id FROM threads WHERE user_id = ? AND gmail_thread_id = ?")
+            .bind(user_id)
+            .bind(&gmail_thread.id)
+            .fetch_one(pool)
+            .await?;
+
+    sqlx::query("DELETE FROM messages WHERE thread_id = ?")
+        .bind(thread_id)
+        .execute(pool)
+        .await?;
+
+    for message in &gmail_thread.messages {
+        let sender = header_value(&message.payload.headers, "From").unwrap_or("(unknown sender)");
+        let sent_at = message.internal_date.as_deref().unwrap_or("");
+        let body = extract_body_text(&message.payload).unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO messages (thread_id, gmail_message_id, sender, body, sent_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(thread_id)
+        .bind(&message.id)
+        .bind(sender)
+        .bind(body)
+        .bind(sent_at)
+        .execute(pool)
+        .await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES (?, 'system', 'Synced latest Gmail thread data', CURRENT_TIMESTAMP)",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn header_value<'a>(headers: &'a [GmailHeader], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
+fn extract_body_text(payload: &GmailPayload) -> Option<String> {
+    let mime_type = payload.mime_type.as_deref();
+    if matches!(mime_type, Some("text/plain" | "text/html"))
+        && let Some(data) = payload.body.as_ref().and_then(|body| body.data.as_ref())
+    {
+        return decode_gmail_body(data);
+    }
+
+    payload.parts.as_ref().and_then(|parts| {
+        parts
+            .iter()
+            .find_map(|part| extract_body_text(part).filter(|body| !body.is_empty()))
+    })
+}
+
+fn decode_gmail_body(data: &str) -> Option<String> {
+    let padded = match data.len() % 4 {
+        0 => data.to_owned(),
+        remainder => format!("{}{}", data, "=".repeat(4 - remainder)),
+    };
+    URL_SAFE
+        .decode(padded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 async fn exchange_google_code(
     state: &AppState,
     code: &str,
@@ -470,13 +678,17 @@ async fn require_user_session(
     let Some(token) = session_token_from_headers(headers) else {
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, (i64, String)>(
-        "SELECT users.id, users.google_email FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
+    let row = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT users.id, users.google_email, users.access_token FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
     )
     .bind(token)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(user_id, email)| UserSession { user_id, email }))
+    Ok(row.map(|(user_id, email, access_token)| UserSession {
+        user_id,
+        email,
+        access_token,
+    }))
 }
 
 fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -517,125 +729,6 @@ async fn initialize_database() -> Result<SqlitePool, Box<dyn Error>> {
     Ok(pool)
 }
 
-struct MockThread<'a> {
-    subject: &'a str,
-    from_display: &'a str,
-    state: &'a str,
-    latest_action: &'a str,
-    waiting_until: Option<&'a str>,
-    updated_at: &'a str,
-}
-
-async fn insert_mock_thread(
-    pool: &SqlitePool,
-    user_id: i64,
-    thread: MockThread<'_>,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO threads (user_id, subject, from_display, state, latest_action, waiting_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(user_id)
-    .bind(thread.subject)
-    .bind(thread.from_display)
-    .bind(thread.state)
-    .bind(thread.latest_action)
-    .bind(thread.waiting_until)
-    .bind(thread.updated_at)
-    .execute(pool)
-    .await?;
-
-    let (thread_id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
-        .fetch_one(pool)
-        .await?;
-    Ok(thread_id)
-}
-
-async fn seed_mock_data(pool: &SqlitePool, user_id: i64) -> Result<(), sqlx::Error> {
-    let (thread_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM threads WHERE user_id = ?")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await?;
-    if thread_count > 0 {
-        return Ok(());
-    }
-
-    let quote_thread_id = insert_mock_thread(
-        pool,
-        user_id,
-        MockThread {
-            subject: "Quote for ACME renewal",
-            from_display: "Sam at ACME",
-            state: "NeedsAction",
-            latest_action: "Draft reply ready",
-            waiting_until: None,
-            updated_at: "2026-07-23T10:00:00Z",
-        },
-    )
-    .await?;
-    let lunch_thread_id = insert_mock_thread(
-        pool,
-        user_id,
-        MockThread {
-            subject: "Lunch next week",
-            from_display: "Mina",
-            state: "Waiting",
-            latest_action: "Waiting for Mina to pick a day",
-            waiting_until: Some("2026-07-25"),
-            updated_at: "2026-07-22T09:00:00Z",
-        },
-    )
-    .await?;
-    let welcome_thread_id = insert_mock_thread(
-        pool,
-        user_id,
-        MockThread {
-            subject: "Welcome to the beta",
-            from_display: "Product Team",
-            state: "Resolved",
-            latest_action: "Classifier marked resolved",
-            waiting_until: None,
-            updated_at: "2026-07-21T08:00:00Z",
-        },
-    )
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO messages (thread_id, sender, body, sent_at) VALUES
-        (?, 'Sam at ACME', 'Can you send over the updated renewal quote?', '2026-07-23T09:30:00Z'),
-        (?, 'You', 'I will take a look and get back to you.', '2026-07-23T09:45:00Z'),
-        (?, 'Mina', 'Want to do lunch next week?', '2026-07-22T09:00:00Z'),
-        (?, 'Product Team', 'Thanks for joining the beta.', '2026-07-21T08:00:00Z')",
-    )
-    .bind(quote_thread_id)
-    .bind(quote_thread_id)
-    .bind(lunch_thread_id)
-    .bind(welcome_thread_id)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO user_forms (thread_id, form_type, title, body, status, created_at) VALUES
-        (?, 'DraftReply', 'Review draft reply', 'Hi Sam, happy to send the updated quote. I will confirm the numbers and follow up shortly.', 'active', '2026-07-23T10:00:00Z')",
-    )
-    .bind(quote_thread_id)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES
-        (?, 'agent', 'Classifier requested a drafted reply', '2026-07-23T09:59:00Z'),
-        (?, 'agent', 'Reply drafter created a draft reply form', '2026-07-23T10:00:00Z'),
-        (?, 'agent', 'Classifier set state to Waiting', '2026-07-22T09:01:00Z'),
-        (?, 'agent', 'Classifier marked thread Resolved', '2026-07-21T08:01:00Z')",
-    )
-    .bind(quote_thread_id)
-    .bind(quote_thread_id)
-    .bind(lunch_thread_id)
-    .bind(welcome_thread_id)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let pool = initialize_database().await?;
@@ -650,6 +743,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/login/google", get(google_start))
         .route("/login/google/callback", get(google_callback))
         .route("/logout", post(logout))
+        .route("/sync", post(sync_gmail))
         .route("/", get(inbox))
         .route("/threads/{id}", get(thread))
         .route("/threads/{id}/submit", post(submit_thread_form))
