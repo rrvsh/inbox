@@ -118,6 +118,12 @@ struct ActionLogRow {
     created_at: String,
 }
 
+#[derive(FromRow)]
+struct ChatRow {
+    role: String,
+    message: String,
+}
+
 struct FilterOption<'a> {
     value: &'a str,
     label: &'a str,
@@ -247,6 +253,7 @@ struct ThreadTemplate {
     messages: Vec<MessageRow>,
     form: Option<UserFormRow>,
     logs: Vec<ActionLogRow>,
+    chats: Vec<ChatRow>,
     user_email: String,
 }
 
@@ -268,6 +275,15 @@ enum ClassifierOutput {
 #[derive(serde::Deserialize)]
 struct DraftOutput {
     draft: String,
+    message: Option<String>,
+}
+
+enum DraftInstruction<'a> {
+    Initial,
+    Revision {
+        current_draft: &'a str,
+        latest_comment: &'a str,
+    },
 }
 
 fn render(template: impl Template) -> Result<Response, AppError> {
@@ -471,6 +487,12 @@ async fn reset_synced_data(
     .bind(session.user_id)
     .execute(&state.pool)
     .await?;
+    sqlx::query(
+        "DELETE FROM thread_chats WHERE thread_id IN (SELECT id FROM threads WHERE user_id = ?)",
+    )
+    .bind(session.user_id)
+    .execute(&state.pool)
+    .await?;
     sqlx::query("DELETE FROM threads WHERE user_id = ?")
         .bind(session.user_id)
         .execute(&state.pool)
@@ -539,12 +561,14 @@ async fn thread(
     .bind(id)
     .fetch_all(&state.pool)
     .await?;
+    let chats = thread_chats(&state.pool, id).await?;
 
     render(ThreadTemplate {
         thread: ThreadView::from(thread),
         messages,
         form,
         logs,
+        chats,
         user_email: session.email,
     })
 }
@@ -577,12 +601,6 @@ async fn submit_thread_form(
     .fetch_optional(&state.pool)
     .await?;
 
-    sqlx::query(
-        "UPDATE user_forms SET status = 'submitted' WHERE thread_id = ? AND status = 'active'",
-    )
-    .bind(id)
-    .execute(&state.pool)
-    .await?;
     let response_text = submission
         .comment
         .as_deref()
@@ -602,25 +620,54 @@ async fn submit_thread_form(
         submission.action.as_str(),
     ) {
         (Some("AskToResolve"), "resolve") => {
+            submit_active_forms(&state.pool, id).await?;
             set_thread_state(&state.pool, id, "Resolved", "User confirmed resolved", None).await?;
             log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
             return Ok(Redirect::to("/"));
         }
         (Some("DraftReply"), "comment") => {
-            let revision_instruction = format!(
-                "Current draft:\n{}\n\nRevision request:\n{}",
-                submission.draft_body.as_deref().unwrap_or_default(),
-                submission.comment.as_deref().unwrap_or_default()
-            );
+            let comment = submission.comment.as_deref().unwrap_or_default().trim();
+            if !comment.is_empty() {
+                insert_thread_chat(&state.pool, id, "user", comment).await?;
+            }
             set_thread_state(&state.pool, id, "Processing", "Revising draft reply", None).await?;
-            run_reply_drafter(&state, &session, id, Some(&revision_instruction)).await?;
+            if let Err(error) = run_reply_drafter(
+                &state,
+                &session,
+                id,
+                DraftInstruction::Revision {
+                    current_draft: submission.draft_body.as_deref().unwrap_or_default(),
+                    latest_comment: comment,
+                },
+            )
+            .await
+            {
+                set_thread_state(
+                    &state.pool,
+                    id,
+                    "NeedsAction",
+                    "Draft revision failed",
+                    None,
+                )
+                .await?;
+                log_thread_event(
+                    &state.pool,
+                    id,
+                    "system",
+                    &format!("Draft revision failed: {}", error.0),
+                )
+                .await?;
+                return Err(error);
+            }
         }
         (Some("DraftReply"), "resolve") => {
+            submit_active_forms(&state.pool, id).await?;
             set_thread_state(&state.pool, id, "Resolved", "User resolved thread", None).await?;
             log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
             return Ok(Redirect::to("/"));
         }
         _ => {
+            submit_active_forms(&state.pool, id).await?;
             set_thread_state(&state.pool, id, "Processing", "Classifier running", None).await?;
             run_classifier(&state, &session, id).await?;
         }
@@ -1022,7 +1069,7 @@ async fn run_classifier(
         ClassifierOutput::NeedsReply => {
             eprintln!("classifier: decision=needs_reply thread_id={thread_id}");
             set_thread_state(&state.pool, thread_id, "Processing", "Drafting reply", None).await?;
-            run_reply_drafter(state, session, thread_id, None).await?;
+            run_reply_drafter(state, session, thread_id, DraftInstruction::Initial).await?;
         }
         ClassifierOutput::Waiting { reason, wake_date } => {
             eprintln!(
@@ -1080,28 +1127,12 @@ async fn run_reply_drafter(
     state: &AppState,
     session: &UserSession,
     thread_id: i64,
-    instruction: Option<&str>,
+    instruction: DraftInstruction<'_>,
 ) -> Result<(), AppError> {
     eprintln!("reply_drafter: start thread_id={thread_id}");
     let Some(openrouter_key) = session.openrouter_key.as_deref() else {
         eprintln!("reply_drafter: missing OpenRouter key thread_id={thread_id}");
-        create_user_form(
-            &state.pool,
-            thread_id,
-            "AskUser",
-            "OpenRouter key required",
-            "Add your OpenRouter API key in Settings, then sync again.",
-        )
-        .await?;
-        set_thread_state(
-            &state.pool,
-            thread_id,
-            "NeedsAction",
-            "OpenRouter key required",
-            None,
-        )
-        .await?;
-        return Ok(());
+        return Err(AppError("OpenRouter key required".to_owned()));
     };
 
     log_thread_event(&state.pool, thread_id, "agent", "Reply drafter started").await?;
@@ -1110,10 +1141,8 @@ async fn run_reply_drafter(
         "reply_drafter: built context thread_id={thread_id} bytes={}",
         context.len()
     );
-    let instruction = instruction.unwrap_or("Draft a concise helpful reply.");
-    let prompt = format!(
-        "Draft an email reply for this thread. Return only JSON: {{\"draft\":\"...\"}}. User instruction: {instruction}\n\n{context}"
-    );
+    let chats = thread_chats(&state.pool, thread_id).await?;
+    let prompt = draft_prompt(&context, &chats, &instruction);
     eprintln!(
         "reply_drafter: calling OpenRouter thread_id={thread_id} prompt_bytes={}",
         prompt.len()
@@ -1122,7 +1151,7 @@ async fn run_reply_drafter(
         &state.http,
         openrouter_key,
         &prompt,
-        "Return exactly one JSON object: {\"draft\":\"...\"}.",
+        "Return exactly one JSON object: {\"draft\":\"...\",\"message\":\"short note to user\"}.",
     )
     .await?;
     eprintln!(
@@ -1146,6 +1175,11 @@ async fn run_reply_drafter(
         None,
     )
     .await?;
+    let chat_message = output.message.as_deref().unwrap_or(match instruction {
+        DraftInstruction::Initial => "I drafted a reply for review.",
+        DraftInstruction::Revision { .. } => "Updated the draft.",
+    });
+    insert_thread_chat(&state.pool, thread_id, "assistant", chat_message).await?;
     log_thread_event(
         &state.pool,
         thread_id,
@@ -1296,6 +1330,71 @@ async fn thread_context(pool: &SqlitePool, thread_id: i64) -> Result<String, sql
         .expect("writing to string cannot fail");
     }
     Ok(context)
+}
+
+fn draft_prompt(context: &str, chats: &[ChatRow], instruction: &DraftInstruction<'_>) -> String {
+    match instruction {
+        DraftInstruction::Initial => format!(
+            "Draft an email reply for this thread. Return only JSON: {{\"draft\":\"...\",\"message\":\"short note to user\"}}. Message should briefly explain what you drafted.\n\nEmail thread:\n{context}"
+        ),
+        DraftInstruction::Revision {
+            current_draft,
+            latest_comment,
+        } => {
+            let mut prompt = format!(
+                "Revise the current draft using the latest user instruction. Return only JSON: {{\"draft\":\"...\",\"message\":\"short note to user\"}}. Message should briefly explain what changed.\n\nEmail thread:\n{context}\n\nCurrent draft:\n{current_draft}\n\nChat history:"
+            );
+            for chat in chats {
+                let role = match chat.role.as_str() {
+                    "user" => "User",
+                    "assistant" => "Assistant",
+                    _ => "Other",
+                };
+                write!(prompt, "\n{role}: {}", chat.message)
+                    .expect("writing to string cannot fail");
+            }
+            write!(prompt, "\n\nLatest user instruction:\n{latest_comment}")
+                .expect("writing to string cannot fail");
+            prompt
+        }
+    }
+}
+
+async fn thread_chats(pool: &SqlitePool, thread_id: i64) -> Result<Vec<ChatRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChatRow>(
+        "SELECT role, message FROM thread_chats WHERE thread_id = ? ORDER BY id ASC",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await
+}
+
+async fn insert_thread_chat(
+    pool: &SqlitePool,
+    thread_id: i64,
+    role: &str,
+    message: &str,
+) -> Result<(), sqlx::Error> {
+    eprintln!("db: insert_thread_chat thread_id={thread_id} role={role} message={message}");
+    sqlx::query(
+        "INSERT INTO thread_chats (thread_id, role, message, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(thread_id)
+    .bind(role)
+    .bind(message)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn submit_active_forms(pool: &SqlitePool, thread_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE user_forms SET status = 'submitted' WHERE thread_id = ? AND status = 'active'",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn create_user_form(

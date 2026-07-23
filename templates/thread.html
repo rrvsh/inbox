@@ -34,21 +34,21 @@
             </div>
 
             <div id="chat_view">
-              {% for entry in logs %}
-                {% if entry.actor == "user" %}
+              {% for chat in chats %}
+                {% if chat.role == "user" %}
                   <div class="chat-message user">
                     <strong>You</strong>
-                    <p>{{ entry.message }}</p>
+                    <p>{{ chat.message }}</p>
                   </div>
                 {% else %}
                   <div class="chat-message agent">
-                    <strong>{{ entry.actor }}</strong>
-                    <p>{{ entry.message }}</p>
+                    <strong>Agent</strong>
+                    <p>{{ chat.message }}</p>
                   </div>
                 {% endif %}
               {% endfor %}
-              {% if logs.len() == 0 %}
-                <p class="muted">No agent conversation yet.</p>
+              {% if chats.len() == 0 %}
+                <p class="muted">No draft conversation yet.</p>
               {% endif %}
 
               {% match form %}
