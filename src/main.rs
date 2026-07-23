@@ -338,7 +338,8 @@ async fn inbox(
     let Some(session) = require_user_session(&headers, &state.pool).await? else {
         return Ok(Redirect::to("/login").into_response());
     };
-    let selected_state = query.state.as_deref().filter(|value| *value != "all");
+    let selected_filter = query.state.as_deref().unwrap_or("NeedsAction");
+    let selected_state = Some(selected_filter).filter(|value| *value != "all");
     let threads = if let Some(selected_state) = selected_state {
         sqlx::query_as::<_, ThreadRow>(
             "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? AND state = ? ORDER BY updated_at DESC",
@@ -367,7 +368,7 @@ async fn inbox(
 
     render(InboxTemplate {
         threads,
-        filters: filters(query.state.as_deref().unwrap_or("all")),
+        filters: filters(selected_filter),
         user_email: session.email,
         sync_message,
         auto_refresh,
@@ -561,6 +562,7 @@ async fn submit_thread_form(
         (Some("AskToResolve"), "resolve") => {
             set_thread_state(&state.pool, id, "Resolved", "User confirmed resolved", None).await?;
             log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
+            return Ok(Redirect::to("/"));
         }
         (Some("DraftReply"), "comment") => {
             let revision_instruction = format!(
@@ -574,6 +576,7 @@ async fn submit_thread_form(
         (Some("DraftReply"), "resolve") => {
             set_thread_state(&state.pool, id, "Resolved", "User resolved thread", None).await?;
             log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
+            return Ok(Redirect::to("/"));
         }
         _ => {
             set_thread_state(&state.pool, id, "Processing", "Classifier running", None).await?;
