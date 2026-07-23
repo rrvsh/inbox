@@ -53,6 +53,11 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
+struct UserSession {
+    user_id: i64,
+    email: String,
+}
+
 #[derive(FromRow)]
 struct ThreadRow {
     id: i64,
@@ -97,7 +102,6 @@ struct InboxQuery {
 #[derive(serde::Deserialize)]
 struct GoogleCallbackQuery {
     code: Option<String>,
-    state: Option<String>,
     error: Option<String>,
 }
 
@@ -125,6 +129,7 @@ struct PageTemplate<'a> {
     title: &'a str,
     heading: &'a str,
     body: &'a str,
+    user_email: &'a str,
 }
 
 #[derive(Template)]
@@ -136,6 +141,7 @@ struct LoginTemplate;
 struct InboxTemplate<'a> {
     threads: Vec<ThreadRow>,
     filters: Vec<FilterOption<'a>>,
+    user_email: String,
 }
 
 #[derive(Template)]
@@ -145,6 +151,7 @@ struct ThreadTemplate {
     messages: Vec<MessageRow>,
     form: Option<UserFormRow>,
     logs: Vec<ActionLogRow>,
+    user_email: String,
 }
 
 fn render(template: impl Template) -> Result<Response, AppError> {
@@ -157,12 +164,6 @@ async fn login() -> Result<Response, AppError> {
 }
 
 async fn google_start(State(state): State<AppState>) -> Result<Response, AppError> {
-    let oauth_state = random_token(&state.pool).await?;
-    sqlx::query("INSERT INTO oauth_states (state) VALUES (?)")
-        .bind(&oauth_state)
-        .execute(&state.pool)
-        .await?;
-
     let mut url = Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
         .map_err(|error| AppError(format!("invalid google auth URL: {error}")))?;
     url.query_pairs_mut()
@@ -174,8 +175,7 @@ async fn google_start(State(state): State<AppState>) -> Result<Response, AppErro
             "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
         )
         .append_pair("access_type", "offline")
-        .append_pair("include_granted_scopes", "true")
-        .append_pair("state", &oauth_state);
+        .append_pair("include_granted_scopes", "true");
 
     Ok(Redirect::to(url.as_str()).into_response())
 }
@@ -195,21 +195,10 @@ async fn google_callback(
     let code = query
         .code
         .ok_or_else(|| AppError("missing OAuth code".to_owned()))?;
-    let oauth_state = query
-        .state
-        .ok_or_else(|| AppError("missing OAuth state".to_owned()))?;
-    let deleted = sqlx::query("DELETE FROM oauth_states WHERE state = ?")
-        .bind(&oauth_state)
-        .execute(&state.pool)
-        .await?
-        .rows_affected();
-    if deleted != 1 {
-        return Ok((axum::http::StatusCode::BAD_REQUEST, "invalid OAuth state").into_response());
-    }
-
     let token = exchange_google_code(&state, &code).await?;
     let email = fetch_gmail_profile_email(&state, &token.access_token).await?;
     let user_id = upsert_user(&state.pool, &email, &token).await?;
+    seed_mock_data(&state.pool, user_id).await?;
     let session_token = create_session(&state.pool, user_id).await?;
 
     let mut response = Redirect::to("/").into_response();
@@ -245,22 +234,25 @@ async fn inbox(
     State(state): State<AppState>,
     Query(query): Query<InboxQuery>,
 ) -> Result<Response, AppError> {
-    if require_user_id(&headers, &state.pool).await?.is_none() {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
         return Ok(Redirect::to("/login").into_response());
-    }
+    };
+    seed_mock_data(&state.pool, session.user_id).await?;
 
     let selected_state = query.state.as_deref().filter(|value| *value != "all");
     let threads = if let Some(selected_state) = selected_state {
         sqlx::query_as::<_, ThreadRow>(
-            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE state = ? ORDER BY updated_at DESC",
+            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? AND state = ? ORDER BY updated_at DESC",
         )
+        .bind(session.user_id)
         .bind(selected_state)
         .fetch_all(&state.pool)
         .await?
     } else {
         sqlx::query_as::<_, ThreadRow>(
-            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads ORDER BY updated_at DESC",
+            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? ORDER BY updated_at DESC",
         )
+        .bind(session.user_id)
         .fetch_all(&state.pool)
         .await?
     };
@@ -268,18 +260,20 @@ async fn inbox(
     render(InboxTemplate {
         threads,
         filters: filters(query.state.as_deref().unwrap_or("all")),
+        user_email: session.email,
     })
 }
 
 async fn settings(headers: HeaderMap, State(state): State<AppState>) -> Result<Response, AppError> {
-    if require_user_id(&headers, &state.pool).await?.is_none() {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
         return Ok(Redirect::to("/login").into_response());
-    }
+    };
 
     render(PageTemplate {
         title: "Settings",
         heading: "Settings",
         body: "OpenRouter API key settings will be wired here.",
+        user_email: &session.email,
     })
 }
 
@@ -288,14 +282,15 @@ async fn thread(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, AppError> {
-    if require_user_id(&headers, &state.pool).await?.is_none() {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
         return Ok(Redirect::to("/login").into_response());
-    }
+    };
 
     let thread = sqlx::query_as::<_, ThreadRow>(
-        "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE id = ?",
+        "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE id = ? AND user_id = ?",
     )
     .bind(id)
+    .bind(session.user_id)
     .fetch_one(&state.pool)
     .await?;
     let messages = sqlx::query_as::<_, MessageRow>(
@@ -322,6 +317,7 @@ async fn thread(
         messages,
         form,
         logs,
+        user_email: session.email,
     })
 }
 
@@ -331,8 +327,19 @@ async fn submit_thread_form(
     Path(id): Path<i64>,
     Form(submission): Form<UserSubmission>,
 ) -> Result<Redirect, AppError> {
-    if require_user_id(&headers, &state.pool).await?.is_none() {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
         return Ok(Redirect::to("/login"));
+    };
+
+    let thread_exists =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM threads WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(session.user_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .is_some();
+    if !thread_exists {
+        return Ok(Redirect::to("/"));
     }
 
     sqlx::query(
@@ -456,18 +463,20 @@ async fn create_session(pool: &SqlitePool, user_id: i64) -> Result<String, sqlx:
     Ok(token)
 }
 
-async fn require_user_id(
+async fn require_user_session(
     headers: &HeaderMap,
     pool: &SqlitePool,
-) -> Result<Option<i64>, sqlx::Error> {
+) -> Result<Option<UserSession>, sqlx::Error> {
     let Some(token) = session_token_from_headers(headers) else {
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, (i64,)>("SELECT user_id FROM sessions WHERE token = ?")
-        .bind(token)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|(user_id,)| user_id))
+    let row = sqlx::query_as::<_, (i64, String)>(
+        "SELECT users.id, users.google_email FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(user_id, email)| UserSession { user_id, email }))
 }
 
 fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -488,7 +497,7 @@ async fn random_token(pool: &SqlitePool) -> Result<String, sqlx::Error> {
 }
 
 fn redirect_uri(config: &AppConfig) -> String {
-    format!("{}/auth/google/callback", config.app_base_url)
+    format!("{}/login/google/callback", config.app_base_url)
 }
 
 fn load_config() -> Result<AppConfig, Box<dyn Error>> {
@@ -505,48 +514,122 @@ async fn initialize_database() -> Result<SqlitePool, Box<dyn Error>> {
     let options = SqliteConnectOptions::from_str("sqlite:inbox.db")?.create_if_missing(true);
     let pool = SqlitePool::connect_with(options).await?;
     sqlx::migrate!().run(&pool).await?;
-    seed_mock_data(&pool).await?;
     Ok(pool)
 }
 
-async fn seed_mock_data(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let (thread_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM threads")
+struct MockThread<'a> {
+    subject: &'a str,
+    from_display: &'a str,
+    state: &'a str,
+    latest_action: &'a str,
+    waiting_until: Option<&'a str>,
+    updated_at: &'a str,
+}
+
+async fn insert_mock_thread(
+    pool: &SqlitePool,
+    user_id: i64,
+    thread: MockThread<'_>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO threads (user_id, subject, from_display, state, latest_action, waiting_until, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(thread.subject)
+    .bind(thread.from_display)
+    .bind(thread.state)
+    .bind(thread.latest_action)
+    .bind(thread.waiting_until)
+    .bind(thread.updated_at)
+    .execute(pool)
+    .await?;
+
+    let (thread_id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+        .fetch_one(pool)
+        .await?;
+    Ok(thread_id)
+}
+
+async fn seed_mock_data(pool: &SqlitePool, user_id: i64) -> Result<(), sqlx::Error> {
+    let (thread_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM threads WHERE user_id = ?")
+        .bind(user_id)
         .fetch_one(pool)
         .await?;
     if thread_count > 0 {
         return Ok(());
     }
 
-    sqlx::query(
-        "INSERT INTO threads (subject, from_display, state, latest_action, waiting_until, updated_at) VALUES
-        ('Quote for ACME renewal', 'Sam at ACME', 'NeedsAction', 'Draft reply ready', NULL, '2026-07-23T10:00:00Z'),
-        ('Lunch next week', 'Mina', 'Waiting', 'Waiting for Mina to pick a day', '2026-07-25', '2026-07-22T09:00:00Z'),
-        ('Welcome to the beta', 'Product Team', 'Resolved', 'Classifier marked resolved', NULL, '2026-07-21T08:00:00Z')",
+    let quote_thread_id = insert_mock_thread(
+        pool,
+        user_id,
+        MockThread {
+            subject: "Quote for ACME renewal",
+            from_display: "Sam at ACME",
+            state: "NeedsAction",
+            latest_action: "Draft reply ready",
+            waiting_until: None,
+            updated_at: "2026-07-23T10:00:00Z",
+        },
     )
-    .execute(pool)
     .await?;
+    let lunch_thread_id = insert_mock_thread(
+        pool,
+        user_id,
+        MockThread {
+            subject: "Lunch next week",
+            from_display: "Mina",
+            state: "Waiting",
+            latest_action: "Waiting for Mina to pick a day",
+            waiting_until: Some("2026-07-25"),
+            updated_at: "2026-07-22T09:00:00Z",
+        },
+    )
+    .await?;
+    let welcome_thread_id = insert_mock_thread(
+        pool,
+        user_id,
+        MockThread {
+            subject: "Welcome to the beta",
+            from_display: "Product Team",
+            state: "Resolved",
+            latest_action: "Classifier marked resolved",
+            waiting_until: None,
+            updated_at: "2026-07-21T08:00:00Z",
+        },
+    )
+    .await?;
+
     sqlx::query(
         "INSERT INTO messages (thread_id, sender, body, sent_at) VALUES
-        (1, 'Sam at ACME', 'Can you send over the updated renewal quote?', '2026-07-23T09:30:00Z'),
-        (1, 'You', 'I will take a look and get back to you.', '2026-07-23T09:45:00Z'),
-        (2, 'Mina', 'Want to do lunch next week?', '2026-07-22T09:00:00Z'),
-        (3, 'Product Team', 'Thanks for joining the beta.', '2026-07-21T08:00:00Z')",
+        (?, 'Sam at ACME', 'Can you send over the updated renewal quote?', '2026-07-23T09:30:00Z'),
+        (?, 'You', 'I will take a look and get back to you.', '2026-07-23T09:45:00Z'),
+        (?, 'Mina', 'Want to do lunch next week?', '2026-07-22T09:00:00Z'),
+        (?, 'Product Team', 'Thanks for joining the beta.', '2026-07-21T08:00:00Z')",
     )
+    .bind(quote_thread_id)
+    .bind(quote_thread_id)
+    .bind(lunch_thread_id)
+    .bind(welcome_thread_id)
     .execute(pool)
     .await?;
     sqlx::query(
         "INSERT INTO user_forms (thread_id, form_type, title, body, status, created_at) VALUES
-        (1, 'DraftReply', 'Review draft reply', 'Hi Sam, happy to send the updated quote. I will confirm the numbers and follow up shortly.', 'active', '2026-07-23T10:00:00Z')",
+        (?, 'DraftReply', 'Review draft reply', 'Hi Sam, happy to send the updated quote. I will confirm the numbers and follow up shortly.', 'active', '2026-07-23T10:00:00Z')",
     )
+    .bind(quote_thread_id)
     .execute(pool)
     .await?;
     sqlx::query(
         "INSERT INTO action_logs (thread_id, actor, message, created_at) VALUES
-        (1, 'agent', 'Classifier requested a drafted reply', '2026-07-23T09:59:00Z'),
-        (1, 'agent', 'Reply drafter created a draft reply form', '2026-07-23T10:00:00Z'),
-        (2, 'agent', 'Classifier set state to Waiting', '2026-07-22T09:01:00Z'),
-        (3, 'agent', 'Classifier marked thread Resolved', '2026-07-21T08:01:00Z')",
+        (?, 'agent', 'Classifier requested a drafted reply', '2026-07-23T09:59:00Z'),
+        (?, 'agent', 'Reply drafter created a draft reply form', '2026-07-23T10:00:00Z'),
+        (?, 'agent', 'Classifier set state to Waiting', '2026-07-22T09:01:00Z'),
+        (?, 'agent', 'Classifier marked thread Resolved', '2026-07-21T08:01:00Z')",
     )
+    .bind(quote_thread_id)
+    .bind(quote_thread_id)
+    .bind(lunch_thread_id)
+    .bind(welcome_thread_id)
     .execute(pool)
     .await?;
 
@@ -564,8 +647,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let app = Router::new()
         .route("/login", get(login))
-        .route("/auth/google/start", get(google_start))
-        .route("/auth/google/callback", get(google_callback))
+        .route("/login/google", get(google_start))
+        .route("/login/google/callback", get(google_callback))
         .route("/logout", post(logout))
         .route("/", get(inbox))
         .route("/threads/{id}", get(thread))

@@ -5,7 +5,10 @@
     <nav>
       <a href="/">Inbox</a> |
       <a href="/settings">Settings</a> |
-      <a href="/login">Login</a>
+      {{ user_email }}
+      <form method="post" action="/logout" style="display: inline">
+        <button type="submit">Logout</button>
+      </form>
     </nav>
     <main>
       <p><a href="/">Back to inbox</a></p>
