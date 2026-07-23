@@ -626,45 +626,16 @@ async fn submit_thread_form(
             return Ok(Redirect::to("/"));
         }
         (Some("DraftReply"), "comment") => {
-            let comment = submission.comment.as_deref().unwrap_or_default().trim();
-            if !comment.is_empty() {
-                insert_thread_chat(&state.pool, id, "user", comment).await?;
-            }
-            set_thread_state(&state.pool, id, "Processing", "Revising draft reply", None).await?;
-            if let Err(error) = run_reply_drafter(
-                &state,
-                &session,
-                id,
-                DraftInstruction::Revision {
-                    current_draft: submission.draft_body.as_deref().unwrap_or_default(),
-                    latest_comment: comment,
-                },
-            )
-            .await
-            {
-                set_thread_state(
-                    &state.pool,
-                    id,
-                    "NeedsAction",
-                    "Draft revision failed",
-                    None,
-                )
-                .await?;
-                log_thread_event(
-                    &state.pool,
-                    id,
-                    "system",
-                    &format!("Draft revision failed: {}", error.0),
-                )
-                .await?;
-                return Err(error);
-            }
+            handle_draft_revision(&state, &session, id, &submission).await?;
         }
         (Some("DraftReply"), "resolve") => {
             submit_active_forms(&state.pool, id).await?;
             set_thread_state(&state.pool, id, "Resolved", "User resolved thread", None).await?;
             log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
             return Ok(Redirect::to("/"));
+        }
+        (Some("AskToResolve" | "AskUser"), "comment") => {
+            handle_classifier_comment(&state, &session, id, &submission).await?;
         }
         _ => {
             submit_active_forms(&state.pool, id).await?;
@@ -674,6 +645,95 @@ async fn submit_thread_form(
     }
 
     Ok(Redirect::to(&format!("/threads/{id}")))
+}
+
+async fn handle_draft_revision(
+    state: &AppState,
+    session: &UserSession,
+    thread_id: i64,
+    submission: &UserSubmission,
+) -> Result<(), AppError> {
+    let comment = submission.comment.as_deref().unwrap_or_default().trim();
+    if !comment.is_empty() {
+        insert_thread_chat(&state.pool, thread_id, "user", comment).await?;
+    }
+    set_thread_state(
+        &state.pool,
+        thread_id,
+        "Processing",
+        "Revising draft reply",
+        None,
+    )
+    .await?;
+    if let Err(error) = run_reply_drafter(
+        state,
+        session,
+        thread_id,
+        DraftInstruction::Revision {
+            current_draft: submission.draft_body.as_deref().unwrap_or_default(),
+            latest_comment: comment,
+        },
+    )
+    .await
+    {
+        set_thread_state(
+            &state.pool,
+            thread_id,
+            "NeedsAction",
+            "Draft revision failed",
+            None,
+        )
+        .await?;
+        log_thread_event(
+            &state.pool,
+            thread_id,
+            "system",
+            &format!("Draft revision failed: {}", error.0),
+        )
+        .await?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn handle_classifier_comment(
+    state: &AppState,
+    session: &UserSession,
+    thread_id: i64,
+    submission: &UserSubmission,
+) -> Result<(), AppError> {
+    let comment = submission.comment.as_deref().unwrap_or_default().trim();
+    if !comment.is_empty() {
+        insert_thread_chat(&state.pool, thread_id, "user", comment).await?;
+    }
+    submit_active_forms(&state.pool, thread_id).await?;
+    set_thread_state(
+        &state.pool,
+        thread_id,
+        "Processing",
+        "Classifier running",
+        None,
+    )
+    .await?;
+    if let Err(error) = run_classifier(state, session, thread_id).await {
+        set_thread_state(
+            &state.pool,
+            thread_id,
+            "NeedsAction",
+            "Classifier failed",
+            None,
+        )
+        .await?;
+        log_thread_event(
+            &state.pool,
+            thread_id,
+            "system",
+            &format!("Classifier failed after user comment: {}", error.0),
+        )
+        .await?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn run_sync_job(state: AppState, session: UserSession, job_id: i64) -> Result<(), AppError> {
@@ -1328,6 +1388,18 @@ async fn thread_context(pool: &SqlitePool, thread_id: i64) -> Result<String, sql
             message.sender, message.sent_at, message.body
         )
         .expect("writing to string cannot fail");
+    }
+    let chats = thread_chats(pool, thread_id).await?;
+    if !chats.is_empty() {
+        context.push_str("\nDraft assistant chat:\n");
+        for chat in chats {
+            let role = match chat.role.as_str() {
+                "user" => "User",
+                "assistant" => "Assistant",
+                _ => "Other",
+            };
+            writeln!(context, "{role}: {}", chat.message).expect("writing to string cannot fail");
+        }
     }
     Ok(context)
 }

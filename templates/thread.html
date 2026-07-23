@@ -53,12 +53,10 @@
 
               {% match form %}
                 {% when Some with (active_form) %}
-                  {% if active_form.form_type == "DraftReply" %}
-                    <textarea id="comment" name="comment" rows="5" placeholder="e.g. make it warmer, ask for invoice details, mention Friday expiry"></textarea>
-                    <p class="actions">
-                      <button type="submit" name="action" value="comment" class="primary">Send</button>
-                    </p>
-                  {% endif %}
+                  <textarea id="comment" name="comment" rows="5" placeholder="e.g. make it warmer, ask for invoice details, say this is not resolved yet"></textarea>
+                  <p class="actions">
+                    <button type="submit" name="action" value="comment" class="primary">Send</button>
+                  </p>
                 {% when None %}
               {% endmatch %}
             </div>
@@ -89,15 +87,11 @@
                 {% else %}
                   <h2>{{ active_form.title }}</h2>
                   <p>{{ active_form.body }}</p>
-                  <textarea name="response" rows="8" placeholder="Write your response"></textarea>
-                  <div class="footer-actions">
-                    {% if active_form.form_type == "AskToResolve" %}
+                  {% if active_form.form_type == "AskToResolve" %}
+                    <div class="footer-actions">
                       <button type="submit" name="action" value="resolve" class="primary">Resolve thread</button>
-                      <button type="submit" name="action" value="comment">Not resolved / send comment</button>
-                    {% else %}
-                      <button type="submit" name="action" value="comment" class="primary">Submit</button>
-                    {% endif %}
-                  </div>
+                    </div>
+                  {% endif %}
                 {% endif %}
               {% when None %}
                 <h2>No active output</h2>
