@@ -1,3 +1,116 @@
-fn main() {
-    println!("Hello, world!");
+use askama::Template;
+use axum::{
+    Router,
+    extract::Path,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+};
+use std::{error::Error, net::SocketAddr};
+
+#[derive(Template)]
+#[template(
+    source = r#"
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>{{ title }}</title></head>
+  <body>
+    <nav>
+      <a href="/">Inbox</a> |
+      <a href="/settings">Settings</a> |
+      <a href="/login">Login</a>
+    </nav>
+    <main>
+      <h1>{{ heading }}</h1>
+      <p>{{ body }}</p>
+    </main>
+  </body>
+</html>
+"#,
+    ext = "html"
+)]
+struct PageTemplate<'a> {
+    title: &'a str,
+    heading: &'a str,
+    body: &'a str,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Thread {{ id }}</title></head>
+  <body>
+    <nav>
+      <a href="/">Inbox</a> |
+      <a href="/settings">Settings</a> |
+      <a href="/login">Login</a>
+    </nav>
+    <main>
+      <p><a href="/">Back to inbox</a></p>
+      <h1>Thread {{ id }}</h1>
+      <p>Thread detail placeholder.</p>
+    </main>
+  </body>
+</html>
+"#,
+    ext = "html"
+)]
+struct ThreadTemplate {
+    id: u64,
+}
+
+fn render(template: impl Template) -> Response {
+    match template.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("template render failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn login() -> Response {
+    render(PageTemplate {
+        title: "Login",
+        heading: "Login with Google",
+        body: "Google OAuth will be wired here.",
+    })
+}
+
+async fn inbox() -> Response {
+    render(PageTemplate {
+        title: "Inbox",
+        heading: "Inbox",
+        body: "Thread list will be rendered here.",
+    })
+}
+
+async fn settings() -> Response {
+    render(PageTemplate {
+        title: "Settings",
+        heading: "Settings",
+        body: "OpenRouter API key settings will be wired here.",
+    })
+}
+
+async fn thread(Path(id): Path<u64>) -> Response {
+    render(ThreadTemplate { id })
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let app = Router::new()
+        .route("/login", get(login))
+        .route("/", get(inbox))
+        .route("/threads/{id}", get(thread))
+        .route("/settings", get(settings));
+
+    let address = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    println!("listening on http://{address}");
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
