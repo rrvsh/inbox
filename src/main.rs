@@ -112,7 +112,9 @@ struct GoogleCallbackQuery {
 #[derive(serde::Deserialize)]
 struct UserSubmission {
     action: String,
-    response: String,
+    response: Option<String>,
+    draft_body: Option<String>,
+    comment: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -220,7 +222,7 @@ struct SettingsTemplate {
 #[serde(tag = "decision", rename_all = "snake_case")]
 enum ClassifierOutput {
     NeedsReply,
-    Waiting { reason: String },
+    Waiting { reason: String, wake_date: String },
     AskToResolve { reason: String },
 }
 
@@ -375,6 +377,40 @@ async fn save_settings(
     Ok(Redirect::to("/settings"))
 }
 
+async fn reset_synced_data(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Redirect, AppError> {
+    let Some(session) = require_user_session(&headers, &state.pool).await? else {
+        return Ok(Redirect::to("/login"));
+    };
+
+    sqlx::query(
+        "DELETE FROM action_logs WHERE thread_id IN (SELECT id FROM threads WHERE user_id = ?)",
+    )
+    .bind(session.user_id)
+    .execute(&state.pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM user_forms WHERE thread_id IN (SELECT id FROM threads WHERE user_id = ?)",
+    )
+    .bind(session.user_id)
+    .execute(&state.pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE user_id = ?)",
+    )
+    .bind(session.user_id)
+    .execute(&state.pool)
+    .await?;
+    sqlx::query("DELETE FROM threads WHERE user_id = ?")
+        .bind(session.user_id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Redirect::to("/settings"))
+}
+
 async fn sync_gmail(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -465,11 +501,17 @@ async fn submit_thread_form(
     .bind(id)
     .execute(&state.pool)
     .await?;
+    let response_text = submission
+        .comment
+        .as_deref()
+        .or(submission.response.as_deref())
+        .or(submission.draft_body.as_deref())
+        .unwrap_or("");
     log_thread_event(
         &state.pool,
         id,
         "user",
-        &format!("Submitted {}: {}", submission.action, submission.response),
+        &format!("Submitted {}: {}", submission.action, response_text),
     )
     .await?;
 
@@ -482,26 +524,17 @@ async fn submit_thread_form(
             log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
         }
         (Some("DraftReply"), "comment") => {
+            let revision_instruction = format!(
+                "Current draft:\n{}\n\nRevision request:\n{}",
+                submission.draft_body.as_deref().unwrap_or_default(),
+                submission.comment.as_deref().unwrap_or_default()
+            );
             set_thread_state(&state.pool, id, "Processing", "Revising draft reply", None).await?;
-            run_reply_drafter(&state, &session, id, Some(&submission.response)).await?;
+            run_reply_drafter(&state, &session, id, Some(&revision_instruction)).await?;
         }
-        (Some("DraftReply"), "send") => {
-            create_user_form(
-                &state.pool,
-                id,
-                "AskUser",
-                "Sending not implemented yet",
-                "Gmail send is not wired yet. Copy the draft into Gmail for now, then comment here when handled.",
-            )
-            .await?;
-            set_thread_state(
-                &state.pool,
-                id,
-                "NeedsAction",
-                "Gmail send not implemented",
-                None,
-            )
-            .await?;
+        (Some("DraftReply"), "resolve") => {
+            set_thread_state(&state.pool, id, "Resolved", "User resolved thread", None).await?;
+            log_thread_event(&state.pool, id, "system", "State changed to Resolved").await?;
         }
         _ => {
             set_thread_state(&state.pool, id, "Processing", "Classifier running", None).await?;
@@ -515,6 +548,7 @@ async fn submit_thread_form(
 fn filters(selected: &str) -> Vec<FilterOption<'_>> {
     [
         ("NeedsAction", "Needs Action"),
+        ("Unprocessed", "Unprocessed"),
         ("all", "All"),
         ("Waiting", "Waiting"),
         ("Processing", "Processing"),
@@ -543,6 +577,14 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
     for thread in threads.threads.unwrap_or_default() {
         let gmail_thread = fetch_gmail_thread(state, session, &thread.id).await?;
         let thread_id = upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+        set_thread_state(
+            &state.pool,
+            thread_id,
+            "Processing",
+            "Classifier running",
+            None,
+        )
+        .await?;
         run_classifier(state, session, thread_id).await?;
     }
 
@@ -584,11 +626,11 @@ async fn upsert_gmail_thread(
 
     sqlx::query(
         "INSERT INTO threads (user_id, gmail_thread_id, subject, from_display, state, latest_action, waiting_until, updated_at, snippet, last_message_at)
-         VALUES (?, ?, ?, ?, 'Processing', 'Synced from Gmail', NULL, CURRENT_TIMESTAMP, ?, ?)
+         VALUES (?, ?, ?, ?, 'Unprocessed', 'Synced from Gmail', NULL, CURRENT_TIMESTAMP, ?, ?)
          ON CONFLICT(user_id, gmail_thread_id) DO UPDATE SET
            subject = excluded.subject,
            from_display = excluded.from_display,
-           state = 'Processing',
+           state = 'Unprocessed',
            latest_action = 'Synced from Gmail',
            updated_at = CURRENT_TIMESTAMP,
            snippet = excluded.snippet,
@@ -669,7 +711,7 @@ async fn run_classifier(
     log_thread_event(&state.pool, thread_id, "agent", "Classifier started").await?;
     let context = thread_context(&state.pool, thread_id).await?;
     let prompt = format!(
-        "Classify this email thread. Return only JSON matching one of: {{\"decision\":\"needs_reply\"}}, {{\"decision\":\"waiting\",\"reason\":\"...\"}}, {{\"decision\":\"ask_to_resolve\",\"reason\":\"...\"}}. The classifier cannot directly resolve threads.\n\n{context}"
+        "Classify this email thread. Return only JSON matching one of: {{\"decision\":\"needs_reply\"}}, {{\"decision\":\"waiting\",\"reason\":\"...\",\"wake_date\":\"YYYY-MM-DD\"}}, {{\"decision\":\"ask_to_resolve\",\"reason\":\"...\"}}. Use needs_reply only when the user owes a reply. Use waiting only when the user has already acted and we need an external response; waiting must include a wake_date. Use ask_to_resolve when no reply is needed and no external response is expected. The classifier cannot directly resolve threads.\n\n{context}"
     );
     let model_response = call_openrouter(&state.http, openrouter_key, &prompt).await?;
     let output = parse_json_content::<ClassifierOutput>(&model_response)?;
@@ -679,20 +721,20 @@ async fn run_classifier(
             set_thread_state(&state.pool, thread_id, "Processing", "Drafting reply", None).await?;
             run_reply_drafter(state, session, thread_id, None).await?;
         }
-        ClassifierOutput::Waiting { reason } => {
+        ClassifierOutput::Waiting { reason, wake_date } => {
             set_thread_state(
                 &state.pool,
                 thread_id,
                 "Waiting",
                 &format!("Waiting: {reason}"),
-                None,
+                Some(&wake_date),
             )
             .await?;
             log_thread_event(
                 &state.pool,
                 thread_id,
                 "agent",
-                &format!("Classifier set Waiting: {reason}"),
+                &format!("Classifier set Waiting until {wake_date}: {reason}"),
             )
             .await?;
         }
@@ -1097,6 +1139,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/threads/{id}", get(thread))
         .route("/threads/{id}/submit", post(submit_thread_form))
         .route("/settings", get(settings).post(save_settings))
+        .route("/settings/reset-data", post(reset_synced_data))
         .with_state(app_state);
 
     let address = SocketAddr::from(([127, 0, 0, 1], 3000));

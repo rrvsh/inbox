@@ -27,20 +27,29 @@
         {% when Some with (active_form) %}
           <section>
             <h3>{{ active_form.title }}</h3>
-            <p>{{ active_form.body }}</p>
             <form method="post" action="/threads/{{ thread.id }}/submit">
-              <textarea name="response" rows="6" cols="80">{{ active_form.body }}</textarea>
-              <p>
-                {% if active_form.form_type == "AskToResolve" %}
+              {% if active_form.form_type == "DraftReply" %}
+                <p><label for="draft_body">Draft</label></p>
+                <textarea id="draft_body" name="draft_body" rows="10" cols="80">{{ active_form.body }}</textarea>
+                <p><label for="comment">Comment</label></p>
+                <textarea id="comment" name="comment" rows="4" cols="80" placeholder="e.g. make it warmer, mention the quote expires Friday"></textarea>
+                <p>
+                  <button type="submit" name="action" value="comment">Revise draft</button>
+                  <button type="submit" name="action" value="send" disabled>Send</button>
                   <button type="submit" name="action" value="resolve">Resolve</button>
-                  <button type="submit" name="action" value="comment">Not resolved / comment</button>
-                {% else if active_form.form_type == "DraftReply" %}
-                  <button type="submit" name="action" value="comment">Revise with comment</button>
-                  <button type="submit" name="action" value="send">Send later</button>
-                {% else %}
-                  <button type="submit" name="action" value="comment">Submit</button>
-                {% endif %}
-              </p>
+                </p>
+              {% else %}
+                <p>{{ active_form.body }}</p>
+                <textarea name="response" rows="6" cols="80"></textarea>
+                <p>
+                  {% if active_form.form_type == "AskToResolve" %}
+                    <button type="submit" name="action" value="resolve">Resolve</button>
+                    <button type="submit" name="action" value="comment">Not resolved / comment</button>
+                  {% else %}
+                    <button type="submit" name="action" value="comment">Submit</button>
+                  {% endif %}
+                </p>
+              {% endif %}
             </form>
           </section>
         {% when None %}
