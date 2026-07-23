@@ -8,26 +8,7 @@ use axum::{
 use std::{error::Error, net::SocketAddr};
 
 #[derive(Template)]
-#[template(
-    source = r#"
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>{{ title }}</title></head>
-  <body>
-    <nav>
-      <a href="/">Inbox</a> |
-      <a href="/settings">Settings</a> |
-      <a href="/login">Login</a>
-    </nav>
-    <main>
-      <h1>{{ heading }}</h1>
-      <p>{{ body }}</p>
-    </main>
-  </body>
-</html>
-"#,
-    ext = "html"
-)]
+#[template(path = "page.html")]
 struct PageTemplate<'a> {
     title: &'a str,
     heading: &'a str,
@@ -35,27 +16,7 @@ struct PageTemplate<'a> {
 }
 
 #[derive(Template)]
-#[template(
-    source = r#"
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Thread {{ id }}</title></head>
-  <body>
-    <nav>
-      <a href="/">Inbox</a> |
-      <a href="/settings">Settings</a> |
-      <a href="/login">Login</a>
-    </nav>
-    <main>
-      <p><a href="/">Back to inbox</a></p>
-      <h1>Thread {{ id }}</h1>
-      <p>Thread detail placeholder.</p>
-    </main>
-  </body>
-</html>
-"#,
-    ext = "html"
-)]
+#[template(path = "thread.html")]
 struct ThreadTemplate {
     id: u64,
 }
