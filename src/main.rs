@@ -519,7 +519,9 @@ async fn sync_gmail(
         session.user_id, session.email
     );
     let worker_state = state.clone();
+    eprintln!("sync_route: spawning worker job_id={job_id}");
     tokio::spawn(async move {
+        eprintln!("sync_job: spawned job_id={job_id}");
         if let Err(error) = run_sync_job(worker_state, session, job_id).await {
             eprintln!("sync_job: failed job_id={job_id} error={}", error.0);
         }
@@ -745,12 +747,7 @@ async fn run_sync_job(state: AppState, session: UserSession, job_id: i64) -> Res
     match sync_latest_threads(&state, &session).await {
         Ok(()) => {
             update_sync_job(&state.pool, job_id, "done", "Gmail sync complete", true).await?;
-            eprintln!("sync_job: done job_id={job_id}; starting processor");
-            tokio::spawn(async move {
-                if let Err(error) = process_unprocessed_threads(state, session).await {
-                    eprintln!("processor: failed error={}", error.0);
-                }
-            });
+            eprintln!("sync_job: done job_id={job_id}");
             Ok(())
         }
         Err(error) => {
@@ -761,15 +758,14 @@ async fn run_sync_job(state: AppState, session: UserSession, job_id: i64) -> Res
 }
 
 async fn create_sync_job(pool: &SqlitePool, user_id: i64) -> Result<i64, sqlx::Error> {
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO sync_jobs (user_id, status, message) VALUES (?, 'queued', 'Sync queued')",
     )
     .bind(user_id)
     .execute(pool)
     .await?;
-    let (job_id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
-        .fetch_one(pool)
-        .await?;
+    let job_id = result.last_insert_rowid();
+    eprintln!("sync_job: created job_id={job_id} user_id={user_id} status=queued");
     Ok(job_id)
 }
 
@@ -894,8 +890,19 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
         .bearer_auth(&session.access_token)
         .query(&[("maxResults", "10")])
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let status = response.status();
+    eprintln!("gmail_sync: threads.list status={status}");
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+        return Err(AppError(format!(
+            "Gmail threads.list failed status={status} body={}",
+            preview(&body)
+        )));
+    }
     let threads = response.json::<GmailThreadsResponse>().await?;
     let threads = threads.threads.unwrap_or_default();
     eprintln!("gmail_sync: received {} thread stubs", threads.len());
@@ -921,9 +928,17 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
             "Queued processing after Gmail sync",
         )
         .await?;
-        eprintln!("gmail_sync: upserted local thread_id={thread_id}; queued processing");
+        let (state_name, latest_action): (String, String) =
+            sqlx::query_as("SELECT state, latest_action FROM threads WHERE id = ?")
+                .bind(thread_id)
+                .fetch_one(&state.pool)
+                .await?;
+        eprintln!(
+            "gmail_sync: upserted local thread_id={thread_id}; state={state_name} latest_action={latest_action}"
+        );
     }
 
+    log_thread_state_counts(&state.pool, session.user_id, "gmail_sync_complete").await?;
     Ok(())
 }
 
@@ -941,8 +956,19 @@ async fn fetch_gmail_thread(
         .bearer_auth(&session.access_token)
         .query(&[("format", "full")])
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let status = response.status();
+    eprintln!("gmail_thread_get: response gmail_thread_id={gmail_thread_id} status={status}");
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+        return Err(AppError(format!(
+            "Gmail thread get failed gmail_thread_id={gmail_thread_id} status={status} body={}",
+            preview(&body)
+        )));
+    }
     Ok(response.json::<GmailThreadResponse>().await?)
 }
 
@@ -1031,40 +1057,89 @@ async fn upsert_gmail_thread(
     Ok(thread_id)
 }
 
-async fn process_unprocessed_threads(
-    state: AppState,
-    session: UserSession,
-) -> Result<(), AppError> {
-    eprintln!(
-        "processor: start user_id={} email={}",
-        session.user_id, session.email
-    );
+async fn processor_loop(state: AppState) {
+    eprintln!("processor: loop started");
     loop {
-        let Some(thread_id) = next_unprocessed_thread_id(&state.pool, session.user_id).await?
-        else {
-            eprintln!("processor: no unprocessed threads remain");
-            return Ok(());
-        };
-        if !claim_unprocessed_thread(&state.pool, thread_id).await? {
-            continue;
+        match process_next_unprocessed_thread(&state).await {
+            Ok(true) => {}
+            Ok(false) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
+            Err(error) => {
+                eprintln!("processor: loop error={}", error.0);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
         }
-        eprintln!("processor: claimed thread_id={thread_id}");
-        log_thread_event(&state.pool, thread_id, "system", "Processing started").await?;
-        run_classifier(&state, &session, thread_id).await?;
     }
 }
 
-async fn next_unprocessed_thread_id(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Option<i64>, sqlx::Error> {
+async fn process_next_unprocessed_thread(state: &AppState) -> Result<bool, AppError> {
+    let Some(thread_id) = next_unprocessed_thread_id(&state.pool).await? else {
+        return Ok(false);
+    };
+    if !claim_unprocessed_thread(&state.pool, thread_id).await? {
+        return Ok(true);
+    }
+    eprintln!("processor: claimed thread_id={thread_id}");
+    let session = user_session_for_thread(&state.pool, thread_id).await?;
+    log_thread_event(&state.pool, thread_id, "system", "Processing started").await?;
+    if let Err(error) = run_classifier(state, &session, thread_id).await {
+        set_thread_state(
+            &state.pool,
+            thread_id,
+            "NeedsAction",
+            "Processing failed",
+            None,
+        )
+        .await?;
+        log_thread_event(
+            &state.pool,
+            thread_id,
+            "system",
+            &format!("Processing failed: {}", error.0),
+        )
+        .await?;
+        return Err(error);
+    }
+    let (state_name, latest_action): (String, String) =
+        sqlx::query_as("SELECT state, latest_action FROM threads WHERE id = ?")
+            .bind(thread_id)
+            .fetch_one(&state.pool)
+            .await?;
+    eprintln!(
+        "processor: completed thread_id={thread_id} state={state_name} latest_action={latest_action}"
+    );
+    log_thread_state_counts(&state.pool, session.user_id, "processor_complete").await?;
+    Ok(true)
+}
+
+async fn next_unprocessed_thread_id(pool: &SqlitePool) -> Result<Option<i64>, sqlx::Error> {
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM threads WHERE user_id = ? AND state = 'Unprocessed' ORDER BY updated_at DESC LIMIT 1",
+        "SELECT id FROM threads WHERE state = 'Unprocessed' ORDER BY updated_at DESC LIMIT 1",
     )
-    .bind(user_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id,)| id))
+}
+
+async fn user_session_for_thread(
+    pool: &SqlitePool,
+    thread_id: i64,
+) -> Result<UserSession, sqlx::Error> {
+    let (user_id, email, access_token, openrouter_key): (i64, String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT users.id, users.google_email, users.access_token, users.openrouter_key
+             FROM threads
+             JOIN users ON users.id = threads.user_id
+             WHERE threads.id = ?",
+        )
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(UserSession {
+        user_id,
+        email,
+        access_token,
+        openrouter_key,
+    })
 }
 
 async fn claim_unprocessed_thread(pool: &SqlitePool, thread_id: i64) -> Result<bool, sqlx::Error> {
@@ -1539,6 +1614,26 @@ async fn log_thread_event(
     Ok(())
 }
 
+async fn log_thread_state_counts(
+    pool: &SqlitePool,
+    user_id: i64,
+    label: &str,
+) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT state, COUNT(*) FROM threads WHERE user_id = ? GROUP BY state ORDER BY state",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let summary = rows
+        .into_iter()
+        .map(|(state, count)| format!("{state}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("thread_counts: label={label} user_id={user_id} {summary}");
+    Ok(())
+}
+
 fn header_value<'a>(headers: &'a [GmailHeader], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -1705,7 +1800,25 @@ async fn initialize_database() -> Result<SqlitePool, Box<dyn Error>> {
     let options = SqliteConnectOptions::from_str("sqlite:inbox.db")?.create_if_missing(true);
     let pool = SqlitePool::connect_with(options).await?;
     sqlx::migrate!().run(&pool).await?;
+    fail_interrupted_sync_jobs(&pool).await?;
     Ok(pool)
+}
+
+async fn fail_interrupted_sync_jobs(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE sync_jobs
+         SET status = 'failed', message = 'Sync interrupted by server restart', completed_at = CURRENT_TIMESTAMP
+         WHERE status IN ('queued', 'running')",
+    )
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        eprintln!(
+            "sync_job: marked interrupted jobs failed count={}",
+            result.rows_affected()
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -1717,6 +1830,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config,
         http: reqwest::Client::new(),
     };
+    tokio::spawn(processor_loop(app_state.clone()));
     let app = Router::new()
         .route("/static/style.css", get(style_css))
         .route("/login", get(login))
