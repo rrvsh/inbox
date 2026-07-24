@@ -130,6 +130,20 @@ th {
 .badge.resolved { border-color: #137333; color: #137333; }
 .badge.processing { border-color: #0645ad; color: #0645ad; }
 
+.last-email {
+  white-space: nowrap;
+}
+
+.unread-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 6px;
+  border-radius: 999px;
+  background: #0645ad;
+  vertical-align: middle;
+}
+
 .muted { color: #666; }
 
 .meta {
@@ -194,6 +208,10 @@ th {
 .message h3 {
   margin: 0 0 8px;
   font-size: 16px;
+}
+
+.message p {
+  white-space: pre-wrap;
 }
 
 .actions {

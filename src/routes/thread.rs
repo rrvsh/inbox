@@ -7,7 +7,7 @@ use axum::{
 use super::forms::UserSubmission;
 use crate::{
     app::AppState,
-    domain::{ActionLogRow, MessageRow, ThreadRow, ThreadView, UserFormRow},
+    domain::{ActionLogRow, MessageRow, MessageView, ThreadRow, ThreadView, UserFormRow},
     error::AppError,
     repository::{
         log_thread_event, require_user_session, set_thread_state, submit_active_forms, thread_chats,
@@ -26,7 +26,7 @@ pub async fn thread(
     };
 
     let thread = sqlx::query_as::<_, ThreadRow>(
-        "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE id = ? AND user_id = ?",
+        "SELECT id, subject, from_display, state, latest_action, waiting_until, last_message_at, unread FROM threads WHERE id = ? AND user_id = ?",
     )
     .bind(id)
     .bind(session.user_id)
@@ -37,7 +37,10 @@ pub async fn thread(
     )
     .bind(id)
     .fetch_all(&state.pool)
-    .await?;
+    .await?
+    .into_iter()
+    .map(MessageView::from)
+    .collect();
     let form = sqlx::query_as::<_, UserFormRow>(
         "SELECT form_type, title, body FROM user_forms WHERE thread_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
     )

@@ -5,7 +5,7 @@ use axum::{
 };
 
 use crate::{
-    domain::{ActionLogRow, ChatRow, FilterOption, MessageRow, ThreadView, UserFormRow},
+    domain::{ActionLogRow, ChatRow, FilterOption, MessageView, ThreadView, UserFormRow},
     error::AppError,
 };
 
@@ -47,7 +47,7 @@ pub struct SyncButtonTemplate {
 #[template(path = "thread.html")]
 pub struct ThreadTemplate {
     pub thread: ThreadView,
-    pub messages: Vec<MessageRow>,
+    pub messages: Vec<MessageView>,
     pub form: Option<UserFormRow>,
     pub logs: Vec<ActionLogRow>,
     pub chats: Vec<ChatRow>,

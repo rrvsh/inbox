@@ -17,7 +17,7 @@ pub async fn fetch_thread_views(
 ) -> Result<Vec<ThreadView>, sqlx::Error> {
     let thread_rows = if let Some(selected_state) = selected_state {
         sqlx::query_as::<_, ThreadRow>(
-            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? AND state = ? ORDER BY updated_at DESC",
+            "SELECT id, subject, from_display, state, latest_action, waiting_until, last_message_at, unread FROM threads WHERE user_id = ? AND state = ? ORDER BY updated_at DESC",
         )
         .bind(user_id)
         .bind(selected_state)
@@ -25,7 +25,7 @@ pub async fn fetch_thread_views(
         .await?
     } else {
         sqlx::query_as::<_, ThreadRow>(
-            "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE user_id = ? ORDER BY updated_at DESC",
+            "SELECT id, subject, from_display, state, latest_action, waiting_until, last_message_at, unread FROM threads WHERE user_id = ? ORDER BY updated_at DESC",
         )
         .bind(user_id)
         .fetch_all(pool)

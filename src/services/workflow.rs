@@ -357,7 +357,7 @@ async fn run_reply_drafter(
 
 pub async fn thread_context(pool: &SqlitePool, thread_id: i64) -> Result<String, sqlx::Error> {
     let thread = sqlx::query_as::<_, ThreadRow>(
-        "SELECT id, subject, from_display, state, latest_action, waiting_until FROM threads WHERE id = ?",
+        "SELECT id, subject, from_display, state, latest_action, waiting_until, last_message_at, unread FROM threads WHERE id = ?",
     )
     .bind(thread_id)
     .fetch_one(pool)
@@ -369,7 +369,7 @@ pub async fn thread_context(pool: &SqlitePool, thread_id: i64) -> Result<String,
     .fetch_all(pool)
     .await?;
     let mut context = format!(
-        "Subject: {}\nFrom: {}\n",
+        "Subject: {}\nParticipants: {}\n",
         thread.subject, thread.from_display
     );
     for message in messages {

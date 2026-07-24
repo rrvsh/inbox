@@ -72,6 +72,8 @@ pub struct GmailMessage {
     pub id: String,
     #[serde(rename = "internalDate")]
     pub internal_date: Option<String>,
+    #[serde(rename = "labelIds")]
+    pub label_ids: Option<Vec<String>>,
     pub payload: GmailPayload,
 }
 
@@ -146,6 +148,56 @@ pub fn header_value<'a>(headers: &'a [GmailHeader], name: &str) -> Option<&'a st
         .map(|header| header.value.as_str())
 }
 
+pub fn participant_emails(thread: &GmailThreadResponse, user_email: &str) -> String {
+    let user_email = user_email.to_lowercase();
+    let mut emails = Vec::new();
+    for message in &thread.messages {
+        for header_name in ["From", "To", "Cc"] {
+            if let Some(value) = header_value(&message.payload.headers, header_name) {
+                for email in emails_from_header(value) {
+                    if email != user_email && !emails.iter().any(|existing| existing == &email) {
+                        emails.push(email);
+                    }
+                }
+            }
+        }
+    }
+    if emails.is_empty() {
+        "(no external participants)".to_owned()
+    } else {
+        emails.join(", ")
+    }
+}
+
+fn emails_from_header(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            let email = if let (Some(start), Some(end)) = (trimmed.rfind('<'), trimmed.rfind('>')) {
+                &trimmed[start + 1..end]
+            } else {
+                trimmed
+            };
+            let email = email.trim().trim_matches('"').to_lowercase();
+            if email.contains('@') {
+                Some(email)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn thread_is_unread(thread: &GmailThreadResponse) -> bool {
+    thread.messages.iter().any(|message| {
+        message
+            .label_ids
+            .as_deref()
+            .is_some_and(|labels| labels.iter().any(|label| label == "UNREAD"))
+    })
+}
+
 pub fn extract_body_text(payload: &GmailPayload) -> Option<String> {
     let mime_type = payload.mime_type.as_deref();
     if matches!(mime_type, Some("text/plain" | "text/html"))
@@ -161,6 +213,30 @@ pub fn extract_body_text(payload: &GmailPayload) -> Option<String> {
     })
 }
 
+fn strip_quoted_reply(body: &str) -> String {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut kept = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('>') || trimmed.contains("reacted via Gmail") {
+            break;
+        }
+        if trimmed.starts_with("On ") {
+            let quote_header = lines[index..]
+                .iter()
+                .take(4)
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if quote_header.contains("wrote:") {
+                break;
+            }
+        }
+        kept.push(*line);
+    }
+    kept.join("\n").trim().to_owned()
+}
+
 fn decode_gmail_body(data: &str) -> Option<String> {
     let padded = match data.len() % 4 {
         0 => data.to_owned(),
@@ -170,4 +246,5 @@ fn decode_gmail_body(data: &str) -> Option<String> {
         .decode(padded)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|body| strip_quoted_reply(&body))
 }

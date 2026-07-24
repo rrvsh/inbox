@@ -20,20 +20,23 @@
       <p><a href="/">Back to inbox</a></p>
       <h1>{{ thread.subject }}</h1>
       <div class="meta">
-        <span><strong>From:</strong> {{ thread.from_display }}</span>
-        <span><strong>State:</strong> <span class="badge {{ thread.state_class }}">{{ thread.state_label }}</span></span>
-        <span><strong>Latest action:</strong> {{ thread.latest_action }}</span>
+        <span><strong>Participants:</strong> {{ thread.from_display }}</span>
+        <span><strong>Status:</strong> <span class="badge {{ thread.state_class }}">{{ thread.status_display }}</span></span>
+        <span><strong>Next action:</strong> {{ thread.next_action }}</span>
+        <span><strong>Last email:</strong> {{ thread.last_message_at_display }}</span>
+        {% if thread.unread %}<span><strong>Unread</strong></span>{% endif %}
       </div>
 
-      <form method="post" action="/threads/{{ thread.id }}/submit">
-        <div class="split">
-          <section class="card chat">
-            <div class="tabs">
-              <button id="chat_tab" class="active" type="button">Chat</button>
-              <button id="log_tab" type="button">Action log</button>
-            </div>
+      <div class="tabs page-tabs">
+        <button id="chat_tab" class="active" type="button">Chat</button>
+        <button id="emails_tab" type="button">Emails</button>
+        <button id="log_tab" type="button">Action log</button>
+      </div>
 
-            <div id="chat_view">
+      <div id="chat_view">
+        <form method="post" action="/threads/{{ thread.id }}/submit">
+          <div class="split">
+            <section class="card chat">
               {% for chat in chats %}
                 {% if chat.role == "user" %}
                   <div class="chat-message user">
@@ -59,75 +62,75 @@
                   </p>
                 {% when None %}
               {% endmatch %}
-            </div>
+            </section>
 
-            <div id="log_view" hidden>
-              <ol>
-                {% for entry in logs %}
-                  <li>{{ entry.created_at }} — {{ entry.actor }} — {{ entry.message }}</li>
-                {% endfor %}
-              </ol>
-              {% if logs.len() == 0 %}
-                <p class="muted">No action log entries yet.</p>
-              {% endif %}
-            </div>
-          </section>
-
-          <section class="card output">
-            {% match form %}
-              {% when Some with (active_form) %}
-                {% if active_form.form_type == "DraftReply" %}
-                  <h2>Draft reply</h2>
-                  <p><label for="draft_body">Final output</label></p>
-                  <textarea id="draft_body" name="draft_body">{{ active_form.body }}</textarea>
-                  <div class="footer-actions">
-                    <button type="submit" name="action" value="send" disabled>Send email</button>
-                    <button type="submit" name="action" value="resolve">Resolve thread without sending email</button>
-                  </div>
-                {% else %}
-                  <h2>{{ active_form.title }}</h2>
-                  <p>{{ active_form.body }}</p>
-                  {% if active_form.form_type == "AskToResolve" %}
+            <section class="card output">
+              {% match form %}
+                {% when Some with (active_form) %}
+                  {% if active_form.form_type == "DraftReply" %}
+                    <h2>Draft reply</h2>
+                    <p><label for="draft_body">Final output</label></p>
+                    <textarea id="draft_body" name="draft_body">{{ active_form.body }}</textarea>
                     <div class="footer-actions">
-                      <button type="submit" name="action" value="resolve" class="primary">Resolve thread</button>
+                      <button type="submit" name="action" value="send" disabled>Send email</button>
+                      <button type="submit" name="action" value="resolve">Resolve thread without sending email</button>
                     </div>
+                  {% else %}
+                    <h2>{{ active_form.title }}</h2>
+                    <p>{{ active_form.body }}</p>
+                    {% if active_form.form_type == "AskToResolve" %}
+                      <div class="footer-actions">
+                        <button type="submit" name="action" value="resolve" class="primary">Resolve thread</button>
+                      </div>
+                    {% endif %}
                   {% endif %}
-                {% endif %}
-              {% when None %}
-                <h2>No active output</h2>
-                <p class="muted">There is no active form or draft for this thread.</p>
-            {% endmatch %}
-          </section>
-        </div>
-      </form>
+                {% when None %}
+                  <h2>No active output</h2>
+                  <p class="muted">There is no active form or draft for this thread.</p>
+              {% endmatch %}
+            </section>
+          </div>
+        </form>
+      </div>
 
-      <h2>Messages</h2>
-      {% for message in messages %}
-        <article class="message">
-          <h3>{{ message.sender }} — {{ message.sent_at }}</h3>
-          <p>{{ message.body }}</p>
-        </article>
-      {% endfor %}
+      <div id="emails_view" hidden>
+        {% for message in messages %}
+          <article class="message">
+            <h3>{{ message.sender }} — {{ message.sent_at_display }}</h3>
+            <p>{{ message.body }}</p>
+          </article>
+        {% endfor %}
+      </div>
+
+      <div id="log_view" hidden>
+        <section class="card">
+          <ol>
+            {% for entry in logs %}
+              <li>{{ entry.created_at }} — {{ entry.actor }} — {{ entry.message }}</li>
+            {% endfor %}
+          </ol>
+          {% if logs.len() == 0 %}
+            <p class="muted">No action log entries yet.</p>
+          {% endif %}
+        </section>
+      </div>
+
     </main>
     <script>
-      const chatTab = document.querySelector('#chat_tab');
-      const logTab = document.querySelector('#log_tab');
-      const chatView = document.querySelector('#chat_view');
-      const logView = document.querySelector('#log_view');
+      const tabs = [
+        [document.querySelector('#chat_tab'), document.querySelector('#chat_view')],
+        [document.querySelector('#emails_tab'), document.querySelector('#emails_view')],
+        [document.querySelector('#log_tab'), document.querySelector('#log_view')],
+      ];
 
-      chatTab.addEventListener('click', () => {
-        chatTab.classList.add('active');
-        logTab.classList.remove('active');
-        chatView.hidden = false;
-        logView.hidden = true;
-      });
-
-      logTab.addEventListener('click', () => {
-        logTab.classList.add('active');
-        chatTab.classList.remove('active');
-        logView.hidden = false;
-        chatView.hidden = true;
-      });
+      for (const [tab, view] of tabs) {
+        tab.addEventListener('click', () => {
+          for (const [otherTab, otherView] of tabs) {
+            otherTab.classList.toggle('active', otherTab === tab);
+            otherView.hidden = otherView !== view;
+          }
+        });
+      }
     </script>
   </body>
 </html>

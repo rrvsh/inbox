@@ -3,10 +3,10 @@
     <thead>
       <tr>
         <th>Thread</th>
-        <th>From</th>
-        <th>State</th>
-        <th>Latest action</th>
-        <th>Waiting until</th>
+        <th>Participants</th>
+        <th>Status</th>
+        <th>Next action</th>
+        <th>Last email</th>
       </tr>
     </thead>
     <tbody>
@@ -14,9 +14,9 @@
         <tr>
           <td><a href="/threads/{{ thread.id }}">{{ thread.subject }}</a></td>
           <td>{{ thread.from_display }}</td>
-          <td><span class="badge {{ thread.state_class }}">{{ thread.state_label }}</span></td>
-          <td>{{ thread.latest_action }}</td>
-          <td>{% match thread.waiting_until %}{% when Some with (value) %}{{ value }}{% when None %}{% endmatch %}</td>
+          <td><span class="badge {{ thread.state_class }}">{{ thread.status_display }}</span></td>
+          <td>{{ thread.next_action }}</td>
+          <td class="last-email">{% if thread.unread %}<span class="unread-dot" title="Unread"></span>{% endif %}{{ thread.last_message_at_display }}</td>
         </tr>
       {% endfor %}
     </tbody>

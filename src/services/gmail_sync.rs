@@ -144,7 +144,7 @@ pub async fn bootstrap_latest_threads(
         "gmail_sync: received {} bootstrap thread stubs",
         threads.len()
     );
-    fetch_and_upsert_threads(state, sync_user.user_id, access_token, &threads).await?;
+    fetch_and_upsert_threads(state, sync_user, access_token, &threads).await?;
     sqlx::query(
         "UPDATE users SET gmail_history_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
@@ -239,7 +239,7 @@ pub async fn sync_incremental_history(
         .into_iter()
         .map(|id| GmailThreadStub { id })
         .collect::<Vec<_>>();
-    fetch_and_upsert_threads(state, sync_user.user_id, access_token, &stubs).await?;
+    fetch_and_upsert_threads(state, sync_user, access_token, &stubs).await?;
 
     if complete {
         if let Some(history_id) = latest_history_id {
@@ -291,7 +291,7 @@ pub fn collect_history_messages(
 
 pub async fn fetch_and_upsert_threads(
     state: &AppState,
-    user_id: i64,
+    sync_user: &SyncUser,
     access_token: &str,
     threads: &[GmailThreadStub],
 ) -> Result<(), AppError> {
@@ -314,7 +314,13 @@ pub async fn fetch_and_upsert_threads(
             gmail_thread.id,
             gmail_thread.messages.len()
         );
-        let thread_id = upsert_gmail_thread(&state.pool, user_id, &gmail_thread).await?;
+        let thread_id = upsert_gmail_thread(
+            &state.pool,
+            sync_user.user_id,
+            &sync_user.email,
+            &gmail_thread,
+        )
+        .await?;
         log_thread_event(
             &state.pool,
             thread_id,
