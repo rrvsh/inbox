@@ -9,15 +9,33 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE};
 use reqwest::Url;
 use sqlx::{FromRow, SqlitePool, sqlite::SqliteConnectOptions};
-use std::{env, error::Error, fmt::Write, net::SocketAddr, str::FromStr};
+use std::{
+    collections::HashSet,
+    env,
+    error::Error,
+    fmt::Write,
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::Semaphore;
 
 const SESSION_COOKIE: &str = "inbox_session";
+const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
+const MAX_CHANGED_THREADS_PER_SYNC: usize = 25;
+const MAX_HISTORY_PAGES_PER_SYNC: usize = 5;
+const SYNC_INTERVAL_SECONDS: u64 = 300;
+const SCHEDULER_TICK_SECONDS: u64 = 30;
+const MAX_ENQUEUES_PER_TICK: i64 = 10;
+const MAX_GLOBAL_CONCURRENT_SYNCS: usize = 5;
 
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
     config: AppConfig,
     http: reqwest::Client,
+    sync_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -59,8 +77,17 @@ impl From<reqwest::Error> for AppError {
 struct UserSession {
     user_id: i64,
     email: String,
-    access_token: String,
     openrouter_key: Option<String>,
+}
+
+struct SyncUser {
+    user_id: i64,
+    email: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    token_expires_at: Option<i64>,
+    gmail_history_id: Option<String>,
+    gmail_reauth_required: bool,
 }
 
 #[derive(FromRow)]
@@ -165,6 +192,40 @@ struct GoogleTokenResponse {
 struct GmailProfileResponse {
     #[serde(rename = "emailAddress")]
     email_address: String,
+    #[serde(rename = "historyId")]
+    history_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailHistoryResponse {
+    history: Option<Vec<GmailHistory>>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(rename = "historyId")]
+    history_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailHistory {
+    #[serde(rename = "messagesAdded")]
+    messages_added: Option<Vec<GmailHistoryMessage>>,
+    #[serde(rename = "messagesDeleted")]
+    messages_deleted: Option<Vec<GmailHistoryMessage>>,
+    #[serde(rename = "labelsAdded")]
+    labels_added: Option<Vec<GmailHistoryMessage>>,
+    #[serde(rename = "labelsRemoved")]
+    labels_removed: Option<Vec<GmailHistoryMessage>>,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailHistoryMessage {
+    message: GmailHistoryMessageRef,
+}
+
+#[derive(serde::Deserialize)]
+struct GmailHistoryMessageRef {
+    #[serde(rename = "threadId")]
+    thread_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -345,16 +406,7 @@ async fn google_callback(
     let email = fetch_gmail_profile_email(&state, &token.access_token).await?;
     eprintln!("oauth_callback: upserting user {email}");
     let user_id = upsert_user(&state.pool, &email, &token).await?;
-    sync_latest_threads(
-        &state,
-        &UserSession {
-            user_id,
-            email: email.clone(),
-            access_token: token.access_token.clone(),
-            openrouter_key: None,
-        },
-    )
-    .await?;
+    sync_gmail_changes(&state, user_id).await?;
     let session_token = create_session(&state.pool, user_id).await?;
 
     let mut response = Redirect::to("/").into_response();
@@ -513,6 +565,14 @@ async fn sync_gmail(
         return Ok(Redirect::to("/login"));
     };
 
+    if active_sync_job_exists(&state.pool, session.user_id).await? {
+        eprintln!(
+            "sync_route: existing sync in progress user_id={} email={}",
+            session.user_id, session.email
+        );
+        return Ok(Redirect::to("/"));
+    }
+
     let job_id = create_sync_job(&state.pool, session.user_id).await?;
     eprintln!(
         "sync_route: queued job_id={job_id} for user_id={} email={}",
@@ -522,7 +582,8 @@ async fn sync_gmail(
     eprintln!("sync_route: spawning worker job_id={job_id}");
     tokio::spawn(async move {
         eprintln!("sync_job: spawned job_id={job_id}");
-        if let Err(error) = run_sync_job(worker_state, session, job_id).await {
+        if let Err(error) = run_sync_job(worker_state, session.user_id, session.email, job_id).await
+        {
             eprintln!("sync_job: failed job_id={job_id} error={}", error.0);
         }
     });
@@ -738,13 +799,20 @@ async fn handle_classifier_comment(
     Ok(())
 }
 
-async fn run_sync_job(state: AppState, session: UserSession, job_id: i64) -> Result<(), AppError> {
+async fn run_sync_job(
+    state: AppState,
+    user_id: i64,
+    email: String,
+    job_id: i64,
+) -> Result<(), AppError> {
+    let _permit = state
+        .sync_semaphore
+        .acquire()
+        .await
+        .map_err(|error| AppError(format!("sync semaphore closed: {error}")))?;
     update_sync_job(&state.pool, job_id, "running", "Starting Gmail sync", false).await?;
-    eprintln!(
-        "sync_job: running job_id={job_id} user_id={} email={}",
-        session.user_id, session.email
-    );
-    match sync_latest_threads(&state, &session).await {
+    eprintln!("sync_job: running job_id={job_id} user_id={user_id} email={email}");
+    match sync_gmail_changes(&state, user_id).await {
         Ok(()) => {
             update_sync_job(&state.pool, job_id, "done", "Gmail sync complete", true).await?;
             eprintln!("sync_job: done job_id={job_id}");
@@ -815,6 +883,74 @@ async fn sync_job_is_running(pool: &SqlitePool, user_id: i64) -> Result<bool, sq
     Ok(status.is_some())
 }
 
+async fn active_sync_job_exists(pool: &SqlitePool, user_id: i64) -> Result<bool, sqlx::Error> {
+    let status: Option<(String,)> = sqlx::query_as(
+        "SELECT status FROM sync_jobs
+         WHERE user_id = ? AND status IN ('queued', 'running')
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(status.is_some())
+}
+
+async fn scheduler_loop(state: AppState) {
+    eprintln!("sync_scheduler: loop started");
+    loop {
+        if let Err(error) = enqueue_due_sync_jobs(&state).await {
+            eprintln!("sync_scheduler: error={}", error.0);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(SCHEDULER_TICK_SECONDS)).await;
+    }
+}
+
+async fn enqueue_due_sync_jobs(state: &AppState) -> Result<(), AppError> {
+    let due_users = due_sync_users(&state.pool).await?;
+    for (user_id, email) in due_users {
+        let job_id = create_sync_job(&state.pool, user_id).await?;
+        eprintln!("sync_scheduler: queued job_id={job_id} user_id={user_id} email={email}");
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_sync_job(worker_state, user_id, email, job_id).await {
+                eprintln!("sync_scheduler: failed job_id={job_id} error={}", error.0);
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn due_sync_users(pool: &SqlitePool) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let interval = format!("-{SYNC_INTERVAL_SECONDS} seconds");
+    sqlx::query_as(
+        "SELECT users.id, users.google_email
+         FROM users
+         LEFT JOIN (
+           SELECT user_id, MAX(completed_at) AS last_completed_at
+           FROM sync_jobs
+           WHERE completed_at IS NOT NULL
+           GROUP BY user_id
+         ) latest_sync ON latest_sync.user_id = users.id
+         WHERE users.gmail_reauth_required = 0
+           AND users.refresh_token IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM sync_jobs active
+             WHERE active.user_id = users.id
+               AND active.status IN ('queued', 'running')
+           )
+           AND (
+             latest_sync.last_completed_at IS NULL
+             OR latest_sync.last_completed_at <= datetime('now', ?)
+           )
+         ORDER BY COALESCE(latest_sync.last_completed_at, '1970-01-01'), random()
+         LIMIT ?",
+    )
+    .bind(interval)
+    .bind(MAX_ENQUEUES_PER_TICK)
+    .fetch_all(pool)
+    .await
+}
+
 async fn fetch_thread_views(
     pool: &SqlitePool,
     user_id: i64,
@@ -879,15 +1015,50 @@ fn state_class(state: &str) -> &'static str {
     }
 }
 
-async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<(), AppError> {
+async fn sync_gmail_changes(state: &AppState, user_id: i64) -> Result<(), AppError> {
+    let mut sync_user = load_sync_user(&state.pool, user_id).await?;
+    if sync_user.gmail_reauth_required {
+        return Err(AppError("Reconnect Gmail before syncing".to_owned()));
+    }
+    let access_token = ensure_gmail_token(state, &mut sync_user).await?;
+    let result = if sync_user.gmail_history_id.is_some() {
+        sync_incremental_history(state, &sync_user, &access_token).await
+    } else {
+        bootstrap_latest_threads(state, &sync_user, &access_token).await
+    };
+    if let Err(error) = result {
+        if !is_gmail_unauthorized(&error) {
+            return Err(error);
+        }
+        eprintln!("gmail_sync: got 401; refreshing token and retrying once");
+        let access_token = refresh_gmail_token(state, &mut sync_user).await?;
+        if sync_user.gmail_history_id.is_some() {
+            sync_incremental_history(state, &sync_user, &access_token).await?;
+        } else {
+            bootstrap_latest_threads(state, &sync_user, &access_token).await?;
+        }
+    }
+    log_thread_state_counts(&state.pool, user_id, "gmail_sync_complete").await?;
+    Ok(())
+}
+
+async fn bootstrap_latest_threads(
+    state: &AppState,
+    sync_user: &SyncUser,
+    access_token: &str,
+) -> Result<(), AppError> {
     eprintln!(
-        "gmail_sync: listing latest 10 threads for user_id={}",
-        session.user_id
+        "gmail_sync: bootstrap latest 10 user_id={} email={}",
+        sync_user.user_id, sync_user.email
     );
+    let profile = fetch_gmail_profile(state, access_token).await?;
+    let history_id = profile
+        .history_id
+        .ok_or_else(|| AppError("Gmail profile did not include historyId".to_owned()))?;
     let response = state
         .http
         .get("https://gmail.googleapis.com/gmail/v1/users/me/threads")
-        .bearer_auth(&session.access_token)
+        .bearer_auth(access_token)
         .query(&[("maxResults", "10")])
         .send()
         .await?;
@@ -905,8 +1076,158 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
     }
     let threads = response.json::<GmailThreadsResponse>().await?;
     let threads = threads.threads.unwrap_or_default();
-    eprintln!("gmail_sync: received {} thread stubs", threads.len());
+    eprintln!(
+        "gmail_sync: received {} bootstrap thread stubs",
+        threads.len()
+    );
+    fetch_and_upsert_threads(state, sync_user.user_id, access_token, &threads).await?;
+    sqlx::query(
+        "UPDATE users SET gmail_history_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(history_id)
+    .bind(sync_user.user_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
 
+async fn sync_incremental_history(
+    state: &AppState,
+    sync_user: &SyncUser,
+    access_token: &str,
+) -> Result<(), AppError> {
+    let start_history_id = sync_user
+        .gmail_history_id
+        .as_deref()
+        .ok_or_else(|| AppError("missing Gmail history cursor".to_owned()))?;
+    eprintln!(
+        "gmail_sync: incremental user_id={} start_history_id={start_history_id}",
+        sync_user.user_id
+    );
+    let mut page_token: Option<String> = None;
+    let mut changed_thread_ids = HashSet::new();
+    let mut latest_history_id: Option<String> = None;
+    let mut complete = true;
+
+    for page_index in 0..MAX_HISTORY_PAGES_PER_SYNC {
+        let mut request = state
+            .http
+            .get("https://gmail.googleapis.com/gmail/v1/users/me/history")
+            .bearer_auth(access_token)
+            .query(&[("startHistoryId", start_history_id)]);
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        eprintln!(
+            "gmail_sync: history.list page={} status={status}",
+            page_index + 1
+        );
+        if status == axum::http::StatusCode::NOT_FOUND {
+            eprintln!("gmail_sync: history cursor invalid; clearing and bootstrapping latest 10");
+            sqlx::query(
+                "UPDATE users SET gmail_history_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(sync_user.user_id)
+            .execute(&state.pool)
+            .await?;
+            bootstrap_latest_threads(state, sync_user, access_token).await?;
+            return Ok(());
+        }
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+            return Err(AppError(format!(
+                "Gmail history.list failed status={status} body={}",
+                preview(&body)
+            )));
+        }
+        let history = response.json::<GmailHistoryResponse>().await?;
+        latest_history_id = history.history_id.or(latest_history_id);
+        collect_changed_thread_ids(
+            &history.history.unwrap_or_default(),
+            &mut changed_thread_ids,
+        );
+        page_token = history.next_page_token;
+        if changed_thread_ids.len() > MAX_CHANGED_THREADS_PER_SYNC {
+            complete = false;
+            break;
+        }
+        if page_token.is_none() {
+            break;
+        }
+        if page_index + 1 == MAX_HISTORY_PAGES_PER_SYNC {
+            complete = false;
+        }
+    }
+
+    let mut thread_ids = changed_thread_ids.into_iter().collect::<Vec<_>>();
+    thread_ids.sort();
+    if thread_ids.len() > MAX_CHANGED_THREADS_PER_SYNC {
+        thread_ids.truncate(MAX_CHANGED_THREADS_PER_SYNC);
+        complete = false;
+    }
+
+    let stubs = thread_ids
+        .into_iter()
+        .map(|id| GmailThreadStub { id })
+        .collect::<Vec<_>>();
+    fetch_and_upsert_threads(state, sync_user.user_id, access_token, &stubs).await?;
+
+    if complete {
+        if let Some(history_id) = latest_history_id {
+            sqlx::query(
+                "UPDATE users SET gmail_history_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(history_id)
+            .bind(sync_user.user_id)
+            .execute(&state.pool)
+            .await?;
+        }
+    } else {
+        eprintln!(
+            "gmail_sync: incremental cap hit user_id={}; leaving history cursor unchanged",
+            sync_user.user_id
+        );
+    }
+    Ok(())
+}
+
+fn is_gmail_unauthorized(error: &AppError) -> bool {
+    error.0.contains("status=401") || error.0.contains("401 Unauthorized")
+}
+
+fn collect_changed_thread_ids(history: &[GmailHistory], changed_thread_ids: &mut HashSet<String>) {
+    for entry in history {
+        collect_history_messages(entry.messages_added.as_deref(), changed_thread_ids);
+        collect_history_messages(entry.messages_deleted.as_deref(), changed_thread_ids);
+        collect_history_messages(entry.labels_added.as_deref(), changed_thread_ids);
+        collect_history_messages(entry.labels_removed.as_deref(), changed_thread_ids);
+    }
+}
+
+fn collect_history_messages(
+    messages: Option<&[GmailHistoryMessage]>,
+    changed_thread_ids: &mut HashSet<String>,
+) {
+    if let Some(messages) = messages {
+        for message in messages {
+            if let Some(thread_id) = message.message.thread_id.as_deref() {
+                changed_thread_ids.insert(thread_id.to_owned());
+            }
+        }
+    }
+}
+
+async fn fetch_and_upsert_threads(
+    state: &AppState,
+    user_id: i64,
+    access_token: &str,
+    threads: &[GmailThreadStub],
+) -> Result<(), AppError> {
     for (index, thread) in threads.iter().enumerate() {
         eprintln!(
             "gmail_sync: fetching thread {}/{} gmail_thread_id={}",
@@ -914,13 +1235,19 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
             threads.len(),
             thread.id
         );
-        let gmail_thread = fetch_gmail_thread(state, session, &thread.id).await?;
+        let Some(gmail_thread) = fetch_gmail_thread(state, access_token, &thread.id).await? else {
+            eprintln!(
+                "gmail_sync: thread missing/removed gmail_thread_id={}",
+                thread.id
+            );
+            continue;
+        };
         eprintln!(
             "gmail_sync: fetched gmail_thread_id={} messages={}",
             gmail_thread.id,
             gmail_thread.messages.len()
         );
-        let thread_id = upsert_gmail_thread(&state.pool, session.user_id, &gmail_thread).await?;
+        let thread_id = upsert_gmail_thread(&state.pool, user_id, &gmail_thread).await?;
         log_thread_event(
             &state.pool,
             thread_id,
@@ -937,28 +1264,29 @@ async fn sync_latest_threads(state: &AppState, session: &UserSession) -> Result<
             "gmail_sync: upserted local thread_id={thread_id}; state={state_name} latest_action={latest_action}"
         );
     }
-
-    log_thread_state_counts(&state.pool, session.user_id, "gmail_sync_complete").await?;
     Ok(())
 }
 
 async fn fetch_gmail_thread(
     state: &AppState,
-    session: &UserSession,
+    access_token: &str,
     gmail_thread_id: &str,
-) -> Result<GmailThreadResponse, AppError> {
+) -> Result<Option<GmailThreadResponse>, AppError> {
     eprintln!("gmail_thread_get: request gmail_thread_id={gmail_thread_id}");
     let response = state
         .http
         .get(format!(
             "https://gmail.googleapis.com/gmail/v1/users/me/threads/{gmail_thread_id}"
         ))
-        .bearer_auth(&session.access_token)
+        .bearer_auth(access_token)
         .query(&[("format", "full")])
         .send()
         .await?;
     let status = response.status();
     eprintln!("gmail_thread_get: response gmail_thread_id={gmail_thread_id} status={status}");
+    if status == axum::http::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !status.is_success() {
         let body = response
             .text()
@@ -969,7 +1297,7 @@ async fn fetch_gmail_thread(
             preview(&body)
         )));
     }
-    Ok(response.json::<GmailThreadResponse>().await?)
+    Ok(Some(response.json::<GmailThreadResponse>().await?))
 }
 
 async fn upsert_gmail_thread(
@@ -1124,20 +1452,18 @@ async fn user_session_for_thread(
     pool: &SqlitePool,
     thread_id: i64,
 ) -> Result<UserSession, sqlx::Error> {
-    let (user_id, email, access_token, openrouter_key): (i64, String, String, Option<String>) =
-        sqlx::query_as(
-            "SELECT users.id, users.google_email, users.access_token, users.openrouter_key
+    let (user_id, email, openrouter_key): (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT users.id, users.google_email, users.openrouter_key
              FROM threads
              JOIN users ON users.id = threads.user_id
              WHERE threads.id = ?",
-        )
-        .bind(thread_id)
-        .fetch_one(pool)
-        .await?;
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await?;
     Ok(UserSession {
         user_id,
         email,
-        access_token,
         openrouter_key,
     })
 }
@@ -1689,19 +2015,37 @@ async fn exchange_google_code(
     Ok(response.json::<GoogleTokenResponse>().await?)
 }
 
-async fn fetch_gmail_profile_email(
+async fn fetch_gmail_profile(
     state: &AppState,
     access_token: &str,
-) -> Result<String, AppError> {
+) -> Result<GmailProfileResponse, AppError> {
     let response = state
         .http
         .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
         .bearer_auth(access_token)
         .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+        return Err(AppError(format!(
+            "Gmail profile failed status={status} body={}",
+            preview(&body)
+        )));
+    }
+    Ok(response.json::<GmailProfileResponse>().await?)
+}
+
+async fn fetch_gmail_profile_email(
+    state: &AppState,
+    access_token: &str,
+) -> Result<String, AppError> {
+    Ok(fetch_gmail_profile(state, access_token)
         .await?
-        .error_for_status()?;
-    let profile = response.json::<GmailProfileResponse>().await?;
-    Ok(profile.email_address)
+        .email_address)
 }
 
 async fn upsert_user(
@@ -1709,19 +2053,23 @@ async fn upsert_user(
     email: &str,
     token: &GoogleTokenResponse,
 ) -> Result<i64, sqlx::Error> {
+    let token_expires_at = token.expires_in.map(|seconds| unix_now() + seconds);
     sqlx::query(
-        "INSERT INTO users (google_email, access_token, refresh_token, expires_in, updated_at)
-         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        "INSERT INTO users (google_email, access_token, refresh_token, expires_in, token_expires_at, gmail_reauth_required, updated_at)
+         VALUES (?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
          ON CONFLICT(google_email) DO UPDATE SET
            access_token = excluded.access_token,
            refresh_token = COALESCE(excluded.refresh_token, users.refresh_token),
            expires_in = excluded.expires_in,
+           token_expires_at = excluded.token_expires_at,
+           gmail_reauth_required = 0,
            updated_at = CURRENT_TIMESTAMP",
     )
     .bind(email)
     .bind(&token.access_token)
     .bind(&token.refresh_token)
     .bind(token.expires_in)
+    .bind(token_expires_at)
     .execute(pool)
     .await?;
 
@@ -1730,6 +2078,114 @@ async fn upsert_user(
         .fetch_one(pool)
         .await?;
     Ok(user_id)
+}
+
+async fn load_sync_user(pool: &SqlitePool, user_id: i64) -> Result<SyncUser, sqlx::Error> {
+    let (
+        user_id,
+        email,
+        access_token,
+        refresh_token,
+        token_expires_at,
+        gmail_history_id,
+        gmail_reauth_required,
+    ): (i64, String, String, Option<String>, Option<i64>, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT id, google_email, access_token, refresh_token, token_expires_at, gmail_history_id, gmail_reauth_required
+             FROM users
+             WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(SyncUser {
+        user_id,
+        email,
+        access_token,
+        refresh_token,
+        token_expires_at,
+        gmail_history_id,
+        gmail_reauth_required: gmail_reauth_required != 0,
+    })
+}
+
+async fn ensure_gmail_token(
+    state: &AppState,
+    sync_user: &mut SyncUser,
+) -> Result<String, AppError> {
+    if let Some(expires_at) = sync_user.token_expires_at
+        && expires_at > unix_now() + TOKEN_REFRESH_SKEW_SECONDS
+    {
+        return Ok(sync_user.access_token.clone());
+    }
+    refresh_gmail_token(state, sync_user).await
+}
+
+async fn refresh_gmail_token(
+    state: &AppState,
+    sync_user: &mut SyncUser,
+) -> Result<String, AppError> {
+    let Some(refresh_token) = sync_user.refresh_token.as_deref() else {
+        mark_gmail_reauth_required(&state.pool, sync_user.user_id).await?;
+        return Err(AppError("Reconnect Gmail before syncing".to_owned()));
+    };
+    let params = [
+        ("client_id", state.config.google_client_id.as_str()),
+        ("client_secret", state.config.google_client_secret.as_str()),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ];
+    let response = state
+        .http
+        .post("https://oauth2.googleapis.com/token")
+        .form(&params)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<failed to read body: {error}>"));
+        mark_gmail_reauth_required(&state.pool, sync_user.user_id).await?;
+        return Err(AppError(format!(
+            "Google token refresh failed status={status} body={}",
+            preview(&body)
+        )));
+    }
+    let token = response.json::<GoogleTokenResponse>().await?;
+    let expires_at = token.expires_in.map(|seconds| unix_now() + seconds);
+    sqlx::query(
+        "UPDATE users SET access_token = ?, expires_in = ?, token_expires_at = ?, gmail_reauth_required = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(&token.access_token)
+    .bind(token.expires_in)
+    .bind(expires_at)
+    .bind(sync_user.user_id)
+    .execute(&state.pool)
+    .await?;
+    sync_user.access_token = token.access_token;
+    sync_user.token_expires_at = expires_at;
+    sync_user.gmail_reauth_required = false;
+    Ok(sync_user.access_token.clone())
+}
+
+async fn mark_gmail_reauth_required(pool: &SqlitePool, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET gmail_reauth_required = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 async fn create_session(pool: &SqlitePool, user_id: i64) -> Result<String, sqlx::Error> {
@@ -1749,20 +2205,17 @@ async fn require_user_session(
     let Some(token) = session_token_from_headers(headers) else {
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, (i64, String, String, Option<String>)>(
-        "SELECT users.id, users.google_email, users.access_token, users.openrouter_key FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
+    let row = sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT users.id, users.google_email, users.openrouter_key FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token = ?",
     )
     .bind(token)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(
-        |(user_id, email, access_token, openrouter_key)| UserSession {
-            user_id,
-            email,
-            access_token,
-            openrouter_key,
-        },
-    ))
+    Ok(row.map(|(user_id, email, openrouter_key)| UserSession {
+        user_id,
+        email,
+        openrouter_key,
+    }))
 }
 
 fn session_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -1829,8 +2282,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         pool,
         config,
         http: reqwest::Client::new(),
+        sync_semaphore: Arc::new(Semaphore::new(MAX_GLOBAL_CONCURRENT_SYNCS)),
     };
     tokio::spawn(processor_loop(app_state.clone()));
+    tokio::spawn(scheduler_loop(app_state.clone()));
     let app = Router::new()
         .route("/static/style.css", get(style_css))
         .route("/login", get(login))
