@@ -2,6 +2,14 @@ use sqlx::SqlitePool;
 
 use crate::domain::{ThreadRow, ThreadView};
 
+pub async fn user_has_threads(pool: &SqlitePool, user_id: i64) -> Result<bool, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM threads WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(count > 0)
+}
+
 pub async fn fetch_thread_views(
     pool: &SqlitePool,
     user_id: i64,

@@ -16,7 +16,7 @@ use crate::{
     },
     repository::{
         create_sync_job, due_sync_users, load_sync_user, log_thread_event, log_thread_state_counts,
-        mark_gmail_reauth_required, update_sync_job, upsert_gmail_thread,
+        mark_gmail_reauth_required, update_sync_job, upsert_gmail_thread, user_has_threads,
     },
 };
 
@@ -81,7 +81,9 @@ pub async fn sync_gmail_changes(state: &AppState, user_id: i64) -> Result<(), Ap
         return Err(AppError("Reconnect Gmail before syncing".to_owned()));
     }
     let access_token = ensure_gmail_token(state, &mut sync_user).await?;
-    let result = if sync_user.gmail_history_id.is_some() {
+    let use_incremental =
+        sync_user.gmail_history_id.is_some() && user_has_threads(&state.pool, user_id).await?;
+    let result = if use_incremental {
         sync_incremental_history(state, &sync_user, &access_token).await
     } else {
         bootstrap_latest_threads(state, &sync_user, &access_token).await
@@ -92,7 +94,9 @@ pub async fn sync_gmail_changes(state: &AppState, user_id: i64) -> Result<(), Ap
         }
         eprintln!("gmail_sync: got 401; refreshing token and retrying once");
         let access_token = refresh_gmail_token(state, &mut sync_user).await?;
-        if sync_user.gmail_history_id.is_some() {
+        let use_incremental =
+            sync_user.gmail_history_id.is_some() && user_has_threads(&state.pool, user_id).await?;
+        if use_incremental {
             sync_incremental_history(state, &sync_user, &access_token).await?;
         } else {
             bootstrap_latest_threads(state, &sync_user, &access_token).await?;

@@ -9,7 +9,7 @@ pub use auth::{
     create_session, load_sync_user, mark_gmail_reauth_required, require_user_session, upsert_user,
 };
 pub use gmail::upsert_gmail_thread;
-pub use inbox::fetch_thread_views;
+pub use inbox::{fetch_thread_views, user_has_threads};
 pub use sync_job::{
     active_sync_job_exists, create_sync_job, due_sync_users, fail_interrupted_sync_jobs,
     sync_job_is_running, update_sync_job,

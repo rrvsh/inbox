@@ -84,6 +84,12 @@ pub async fn reset_synced_data(
         .bind(session.user_id)
         .execute(&state.pool)
         .await?;
+    sqlx::query(
+        "UPDATE users SET gmail_history_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(session.user_id)
+    .execute(&state.pool)
+    .await?;
 
     Ok(Redirect::to("/settings"))
 }
